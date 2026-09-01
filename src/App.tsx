@@ -43,6 +43,12 @@ interface StatusItem {
   status: string;
 }
 
+interface RecentEntry {
+  path: string;
+  name: string;
+  lastOpened: number;
+}
+
 // ---------- 文件树工具：平铺路径 → 嵌套树 ----------
 
 interface TreeNode {
@@ -226,6 +232,17 @@ function useDebounced<T>(value: T, ms: number): T {
   return v;
 }
 
+// 把秒级时间戳转成"X分钟前 / X小时前 / 昨天 / YYYY-MM-DD"
+function formatRelative(ts: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const diff = Math.max(0, now - ts);
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 2) return "昨天";
+  return new Date(ts * 1000).toLocaleDateString("zh-CN");
+}
+
 // ---------- 主组件 ----------
 
 function App() {
@@ -243,6 +260,7 @@ function App() {
   const [commitMsg, setCommitMsg] = useState("");
   const [filterBranch, setFilterBranch] = useState(""); // "" = 全部（HEAD）
   const [filterQuery, setFilterQuery] = useState("");
+  const [recent, setRecent] = useState<RecentEntry[]>([]);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -279,6 +297,8 @@ function App() {
       setSelected(null);
       setFiles([]);
       setDiff("");
+      // 异步记一条最近打开，失败不阻塞主流程
+      invoke("add_recent", { path: summary.path }).catch(() => {});
     } catch (e) {
       setError(String(e));
       setRepo(null);
@@ -307,6 +327,18 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh, debouncedQuery, debouncedBranch]);
+
+  // 没打开仓库时拉一次最近列表（点开仓库后切到主视图，回到首页才需要重新拉）
+  useEffect(() => {
+    if (repo) return;
+    (async () => {
+      try {
+        setRecent(await invoke<RecentEntry[]>("get_recent"));
+      } catch {
+        // 拉取失败就清空，不影响主流程
+      }
+    })();
+  }, [repo]);
 
   // ---------- 分支 / 提交操作 ----------
 
@@ -409,12 +441,59 @@ function App() {
       {!repo ? (
         <div className="welcome">
           <h2>输入仓库路径开始</h2>
-          <p>
-            例如：打开本项目自身试试 —
-            <button className="link" onClick={() => openRepo("C:\\Users\\guohj\\code\\gitmanage")}>
-              C:\Users\guohj\code\gitmanage
-            </button>
+          <p className="welcome-hint">
+            也可以点右上角「浏览…」选目录（支持选中仓库内任意子目录）。
           </p>
+
+          {recent.length > 0 && (
+            <>
+              <div className="recent-title">最近打开</div>
+              <ul className="recent-list">
+                {recent.map((r) => (
+                  <li key={r.path} className="recent-item">
+                    <button
+                      className="recent-main"
+                      title={r.path}
+                      onClick={() => openRepo(r.path)}
+                    >
+                      <span className="recent-icon">📁</span>
+                      <div className="recent-meta">
+                        <div className="recent-name">{r.name}</div>
+                        <div className="recent-path">{r.path}</div>
+                      </div>
+                      <span className="recent-time">
+                        {formatRelative(r.lastOpened)}
+                      </span>
+                    </button>
+                    <button
+                      className="recent-remove"
+                      title="从列表中移除"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await invoke("remove_recent", { path: r.path });
+                          setRecent((prev) => prev.filter((x) => x.path !== r.path));
+                        } catch (err) {
+                          setError(String(err));
+                        }
+                      }}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {recent.length === 0 && (
+            <p className="welcome-hint">
+              例如：打开本项目自身试试 —
+              <button className="link" onClick={() => openRepo("C:\\Users\\guohj\\code\\gitmanage")}>
+                C:\Users\guohj\code\gitmanage
+              </button>
+            </p>
+          )}
         </div>
       ) : (
         <div className="main">

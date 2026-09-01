@@ -12,12 +12,51 @@
 //! git2 使用 default-features=false（无 ssh/https/openssl），只做本地操作。
 
 use git2::{BranchType, DiffFormat, ObjectType, Oid, Repository, Sort, TreeWalkResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tauri::Manager; // AppHandle::path() 来自这个 trait
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 struct AppState {
     repo: Mutex<Option<Repository>>,
+}
+
+// ---------- 最近打开的仓库 ----------
+
+const RECENT_LIMIT: usize = 10;
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecentEntry {
+    path: String,
+    name: String,
+    last_opened: i64, // unix 秒
+}
+
+/// 存到 AppData 下的配置目录（Windows: %APPDATA%\com.guohj.gitmanage\）
+fn recent_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("无法解析 app 配置目录: {e}"))?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    Ok(dir.join("recent.json"))
+}
+
+fn read_recent(app: &tauri::AppHandle) -> Vec<RecentEntry> {
+    let Ok(path) = recent_file_path(app) else { return vec![] };
+    let Ok(bytes) = std::fs::read(&path) else { return vec![] };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn write_recent(app: &tauri::AppHandle, list: &[RecentEntry]) -> Result<(), String> {
+    let path = recent_file_path(app)?;
+    let bytes = serde_json::to_vec_pretty(list).map_err(to_err)?;
+    std::fs::write(&path, bytes).map_err(to_err)?;
+    Ok(())
 }
 
 // ---------- 数据结构（serde camelCase，前端 TS 直接对应） ----------
@@ -420,6 +459,45 @@ fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Re
 // ---------- 暂存与提交 ----------
 
 #[tauri::command]
+fn get_recent(app: tauri::AppHandle) -> Vec<RecentEntry> {
+    let mut list = read_recent(&app);
+    list.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+    list
+}
+
+#[tauri::command]
+fn add_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut list = read_recent(&app);
+    // dedupe（同路径移除旧条目），新条目推到首位
+    list.retain(|e| !e.path.eq_ignore_ascii_case(&path));
+    list.insert(
+        0,
+        RecentEntry {
+            path,
+            name,
+            last_opened: now,
+        },
+    );
+    list.truncate(RECENT_LIMIT);
+    write_recent(&app, &list)
+}
+
+#[tauri::command]
+fn remove_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let mut list = read_recent(&app);
+    list.retain(|e| !e.path.eq_ignore_ascii_case(&path));
+    write_recent(&app, &list)
+}
+
+#[tauri::command]
 fn stage_all(state: tauri::State<AppState>) -> Result<usize, String> {
     with_repo!(state, repo, {
         let mut index = repo.index().map_err(to_err)?;
@@ -477,6 +555,9 @@ pub fn run() {
             delete_branch,
             stage_all,
             commit,
+            get_recent,
+            add_recent,
+            remove_recent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
