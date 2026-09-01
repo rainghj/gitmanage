@@ -611,6 +611,34 @@ fn git_remote_op(
     })
 }
 
+/// 当前分支与其上游（upstream）的领先/落后提交数：(ahead, behind)。
+/// ahead = 本地领先、待 push 的条数；behind = 远程领先、待 pull 的条数。
+/// 无上游（未关联远程分支 / 纯本地仓库）返回 None，前端不显示角标。
+/// 注意：behind 只反映"上次 fetch 时"的远程状态——这是所有 Git GUI 的共同语义。
+#[tauri::command]
+fn get_ahead_behind(state: tauri::State<AppState>) -> Result<Option<(usize, usize)>, String> {
+    with_repo!(state, repo, {
+        let local_oid = match repo.head().ok().and_then(|h| h.target()) {
+            Some(o) => o,
+            None => return Ok(None), // 空仓库 / 分离 HEAD
+        };
+        let branch_name = match repo.head().ok().and_then(|h| h.shorthand().map(|s| s.to_string())) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let upstream_oid = match branch.upstream().ok().and_then(|u| u.get().target()) {
+            Some(o) => o,
+            None => return Ok(None), // 未设置 upstream
+        };
+        let ab = repo.graph_ahead_behind(local_oid, upstream_oid).map_err(to_err)?;
+        Ok(Some(ab))
+    })
+}
+
 /// 读取指定远程（默认 origin）的 URL，用于「设置远程」弹层预填；未配置时返回 None。
 #[tauri::command]
 fn get_remote_url(state: tauri::State<AppState>, name: Option<String>) -> Result<Option<String>, String> {
@@ -787,6 +815,7 @@ pub fn run() {
             reveal_in_explorer,
             close_repo,
             git_remote_op,
+            get_ahead_behind,
             get_remote_url,
             set_remote_url,
             stash_list,

@@ -682,6 +682,18 @@ button.ghost.small {
   flex-shrink: 0;
 }
 
+/* pull/push 按钮上的待操作条数角标（pull=远程领先，push=本地领先） */
+.sync-badge {
+  margin-left: 4px;
+  background: var(--accent-2);
+  color: #fff;
+  border-radius: 8px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+}
+
 /* 「设置远程」展开的输入行 */
 .remote-edit {
   display: flex;

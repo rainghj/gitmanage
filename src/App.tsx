@@ -278,11 +278,13 @@ function App() {
   const [leftTab, setLeftTab] = useState<"branches" | "files">("branches"); // 左栏顶部 tab：分支树 / 文件树
   const [remoteUrlOpen, setRemoteUrlOpen] = useState(false); // 中栏过滤条上的「设置远程」输入行
   const [remoteUrl, setRemoteUrl] = useState("");
+  // [ahead, behind]：待 push / 待 pull 条数；null = 无上游（纯本地仓库）不显示角标
+  const [syncCounts, setSyncCounts] = useState<[number, number] | null>(null);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st, s] = await Promise.all([
+      const [bs, log, t, st, s, ab] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: 300,
@@ -292,12 +294,14 @@ function App() {
         invoke<string[]>("get_head_tree"),
         invoke<StatusItem[]>("get_status"),
         invoke<StashEntry[]>("stash_list"),
+        invoke<[number, number] | null>("get_ahead_behind"),
       ]);
       setBranches(bs);
       setCommits(log);
       setTree(t);
       setStatus(st);
       setStashes(s);
+      setSyncCounts(ab);
     } catch (e) {
       setError(String(e));
     }
@@ -1040,17 +1044,31 @@ function App() {
                   className="ghost small"
                   onClick={() => doRemoteOp("pull")}
                   disabled={opBusy !== null}
-                  title="git pull（当前分支）"
+                  title={
+                    syncCounts && syncCounts[1] > 0
+                      ? `git pull（当前分支）—— 远程领先 ${syncCounts[1]} 条（基于上次 fetch）`
+                      : "git pull（当前分支）"
+                  }
                 >
                   {opBusy === "pull" ? "…" : "↓ pull"}
+                  {!opBusy && syncCounts && syncCounts[1] > 0 && (
+                    <span className="sync-badge">{syncCounts[1]}</span>
+                  )}
                 </button>
                 <button
                   className="ghost small"
                   onClick={() => doRemoteOp("push")}
                   disabled={opBusy !== null}
-                  title="git push（当前分支）"
+                  title={
+                    syncCounts && syncCounts[0] > 0
+                      ? `git push（当前分支）—— 本地领先 ${syncCounts[0]} 条`
+                      : "git push（当前分支）"
+                  }
                 >
                   {opBusy === "push" ? "…" : "↑ push"}
+                  {!opBusy && syncCounts && syncCounts[0] > 0 && (
+                    <span className="sync-badge">{syncCounts[0]}</span>
+                  )}
                 </button>
                 <button
                   className="ghost small"
