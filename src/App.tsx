@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 // ---------- 类型（对应 Rust 侧的 serde camelCase） ----------
@@ -177,6 +178,19 @@ function App() {
     }
   }
 
+  // 弹出系统文件夹选择器，选中后直接打开该仓库
+  async function browseFolder() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: repoPath || undefined,
+      title: "选择 Git 仓库目录",
+    });
+    if (!selected) return; // 用户取消
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (path) await openRepo(path);
+  }
+
   useEffect(() => {
     refresh();
   }, [refresh]);
@@ -258,6 +272,9 @@ function App() {
           onChange={(e) => setRepoPath(e.currentTarget.value)}
           onKeyDown={(e) => e.key === "Enter" && openRepo()}
         />
+        <button className="ghost" onClick={browseFolder} disabled={loading} title="弹出文件夹选择器">
+          浏览…
+        </button>
         <button onClick={() => openRepo()} disabled={loading}>
           {loading ? "打开中…" : "打开仓库"}
         </button>
