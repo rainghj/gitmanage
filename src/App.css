@@ -330,9 +330,28 @@ button.link {
 }
 
 .commit-item {
-  padding: 6px 10px;
+  padding: 0 10px;
+  /* 高度需与 App.tsx 里 GRAPH_ROW_H 保持一致，分支图 SVG 才能接得上 */
+  height: 46px;
   border-bottom: 1px solid #2a2a2a;
   cursor: pointer;
+}
+
+.commit-row {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.commit-graph {
+  flex-shrink: 0;
+  margin-right: 6px;
+}
+
+.commit-content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .commit-item:hover {

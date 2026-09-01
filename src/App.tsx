@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
@@ -90,6 +90,97 @@ function FileTreeView({ nodes, depth = 0 }: { nodes: TreeNode[]; depth?: number 
   );
 }
 
+// ---------- 分支图（lane 计算 + SVG 渲染） ----------
+//
+// 算法：维护 lanes 数组，lanes[i] 表示第 i 条泳道下一个预期出现的 commit oid。
+// 遍历提交（后端已按时间拓扑序返回）：
+//   - 若当前 commit 已在某条泳道上 → 沿用该泳道
+//   - 否则占一条空泳道（没有就新开一条）
+//   - 第一父提交接管当前泳道；merge 的其他父提交另开泳道（这就是分叉/汇合的来源）
+
+interface GraphRow {
+  lane: number; // 本行 commit 所在泳道
+  occupied: boolean[]; // 本行有哪些泳道有竖线穿过
+  mergeLane: number | null; // merge 提交第二父所在泳道（画汇合曲线用）
+  isMerge: boolean;
+}
+
+const GRAPH_LANE_W = 14; // 每条泳道宽度
+const GRAPH_ROW_H = 46; // 行高，需与 CSS .commit-item 的高度一致
+const LANE_COLORS = ["#569cd6", "#4ec9b0", "#d7ba7d", "#ce9178", "#b5cea8", "#9cdcfe"];
+
+function computeGraph(commits: CommitInfo[]): { rows: GraphRow[]; laneCount: number } {
+  const lanes: (string | null)[] = [];
+  const rows: GraphRow[] = commits.map((c) => {
+    let idx = lanes.indexOf(c.oid);
+    if (idx === -1) {
+      const free = lanes.indexOf(null);
+      if (free === -1) {
+        idx = lanes.length;
+        lanes.push(null);
+      } else {
+        idx = free;
+      }
+    }
+    // 快照：本行有竖线穿过的泳道
+    const occupied = lanes.map((o) => o !== null);
+
+    // merge：第二父提交另开一条泳道
+    let mergeLane: number | null = null;
+    if (c.parents.length > 1) {
+      const free = lanes.indexOf(null);
+      mergeLane = free === -1 ? lanes.length : free;
+      if (free === -1) lanes.push(null);
+      lanes[mergeLane] = c.parents[1];
+      occupied[mergeLane] = true;
+    }
+
+    // 第一父接管当前泳道
+    lanes[idx] = c.parents[0] ?? null;
+    return { lane: idx, occupied, mergeLane, isMerge: c.parents.length > 1 };
+  });
+
+  const laneCount = Math.max(1, ...rows.map((r) => Math.max(r.occupied.length, r.lane + 1)));
+  return { rows, laneCount };
+}
+
+function CommitGraph({ row, laneCount, isLast }: { row: GraphRow; laneCount: number; isLast: boolean }) {
+  const w = laneCount * GRAPH_LANE_W;
+  const x = (i: number) => i * GRAPH_LANE_W + GRAPH_LANE_W / 2;
+  const midY = GRAPH_ROW_H / 2;
+  const color = LANE_COLORS[row.lane % LANE_COLORS.length];
+
+  return (
+    <svg className="commit-graph" width={w} height={GRAPH_ROW_H} viewBox={`0 0 ${w} ${GRAPH_ROW_H}`}>
+      {/* 竖线：穿过本行的每条泳道 */}
+      {row.occupied.map((on, i) =>
+        on ? (
+          <line
+            key={i}
+            x1={x(i)}
+            y1={0}
+            x2={x(i)}
+            y2={isLast ? midY : GRAPH_ROW_H}
+            stroke={LANE_COLORS[i % LANE_COLORS.length]}
+            strokeWidth={2}
+          />
+        ) : null
+      )}
+      {/* merge 汇合曲线：从本行圆心绕到第二父泳道 */}
+      {row.mergeLane !== null && (
+        <path
+          d={`M ${x(row.lane)} ${midY} C ${x(row.lane)} ${GRAPH_ROW_H}, ${x(row.mergeLane)} ${midY}, ${x(row.mergeLane)} ${GRAPH_ROW_H}`}
+          fill="none"
+          stroke={LANE_COLORS[row.mergeLane % LANE_COLORS.length]}
+          strokeWidth={2}
+        />
+      )}
+      {/* 本行提交节点 */}
+      <circle cx={x(row.lane)} cy={midY} r={4} fill={color} stroke="#1e1e1e" strokeWidth={1.5} />
+    </svg>
+  );
+}
+
 // ---------- diff 渲染 ----------
 
 function DiffView({ text }: { text: string }) {
@@ -166,7 +257,8 @@ function App() {
     try {
       const summary = await invoke<RepoSummary>("open_repo", { path });
       setRepo(summary);
-      setRepoPath(path);
+      // 回填真实仓库根：选中子目录时 Rust 侧会向上找到 .git，输入框显示实际根目录
+      setRepoPath(summary.path);
       setSelected(null);
       setFiles([]);
       setDiff("");
@@ -256,6 +348,7 @@ function App() {
     })();
   }, [selected]);
 
+  const { rows: graphRows, laneCount } = useMemo(() => computeGraph(commits), [commits]);
   const localBranches = branches.filter((b) => !b.isRemote);
   const remoteBranches = branches.filter((b) => b.isRemote);
   const current = branches.find((b) => b.isHead);
@@ -267,7 +360,7 @@ function App() {
         <span className="logo">GitManage</span>
         <input
           className="repo-input"
-          placeholder="仓库路径，如 C:\Users\you\code\project"
+          placeholder="仓库路径，或直接点「浏览…」选择（支持选中仓库内任意子目录）"
           value={repoPath}
           onChange={(e) => setRepoPath(e.currentTarget.value)}
           onKeyDown={(e) => e.key === "Enter" && openRepo()}
@@ -377,26 +470,35 @@ function App() {
             </div>
             <div className="pane-title">提交历史（{commits.length}）</div>
             <div className="pane-body commit-list">
-              {commits.map((c) => (
+              {commits.map((c, i) => (
                 <div
                   key={c.oid}
                   className={`commit-item ${selected === c.oid ? "selected" : ""}`}
                   onClick={() => setSelected(c.oid)}
                 >
-                  <div className="commit-summary">
-                    <span className="hash">{c.short}</span>
-                    {c.refs.map((r) => (
-                      <span key={r} className={`ref-chip ${r.includes("/") ? "remote" : "local"}`}>
-                        {r}
-                      </span>
-                    ))}
-                    <span className="summary-text" title={c.summary}>
-                      {c.summary}
-                    </span>
-                  </div>
-                  <div className="commit-meta">
-                    {c.author} · {new Date(c.time * 1000).toLocaleString("zh-CN")}
-                    {c.parents.length > 1 && <span className="merge-tag">merge</span>}
+                  <div className="commit-row">
+                    <CommitGraph
+                      row={graphRows[i]}
+                      laneCount={laneCount}
+                      isLast={i === commits.length - 1}
+                    />
+                    <div className="commit-content">
+                      <div className="commit-summary">
+                        <span className="hash">{c.short}</span>
+                        {c.refs.map((r) => (
+                          <span key={r} className={`ref-chip ${r.includes("/") ? "remote" : "local"}`}>
+                            {r}
+                          </span>
+                        ))}
+                        <span className="summary-text" title={c.summary}>
+                          {c.summary}
+                        </span>
+                      </div>
+                      <div className="commit-meta">
+                        {c.author} · {new Date(c.time * 1000).toLocaleString("zh-CN")}
+                        {c.parents.length > 1 && <span className="merge-tag">merge</span>}
+                      </div>
+                    </div>
                   </div>
                 </div>
               ))}

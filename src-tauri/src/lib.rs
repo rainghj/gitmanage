@@ -87,13 +87,26 @@ macro_rules! with_repo {
 
 #[tauri::command]
 fn open_repo(state: tauri::State<AppState>, path: String) -> Result<RepoSummary, String> {
-    let repo = Repository::open(&path).map_err(to_err)?;
-    let name = repo
+    // discover 会沿目录向上逐级找 .git，因此选中仓库的子目录也能打开；
+    // 找不到再退回严格 open，两者都失败才报错
+    let repo = Repository::discover(&path).or_else(|_| Repository::open(&path)).map_err(|_| {
+        format!("在 {path} 及其父目录中没有找到 Git 仓库")
+    })?;
+
+    // 真实仓库根（去掉结尾分隔符），裸库回退到 .git 的父目录
+    let root = repo
         .workdir()
         .or_else(|| repo.path().parent())
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|p| {
+            p.to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_string()
+        })
         .unwrap_or_else(|| path.clone());
+    let name = std::path::Path::new(&root)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.clone());
     let is_empty = repo.is_empty().map_err(to_err)?;
 
     // head 引用借用 repo，先在块内提取 owned 值并随块结束 drop，之后才能 move repo 进 state
@@ -111,7 +124,7 @@ fn open_repo(state: tauri::State<AppState>, path: String) -> Result<RepoSummary,
 
     *state.repo.lock().map_err(to_err)? = Some(repo);
     Ok(RepoSummary {
-        path,
+        path: root,
         name,
         current_branch,
         is_empty,
