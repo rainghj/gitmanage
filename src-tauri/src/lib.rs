@@ -1,0 +1,338 @@
+//! gitmanage - 轻量 Git 管理器（Tauri 后端）
+//!
+//! 命令桥设计：
+//! - open_repo        打开本地仓库，返回概要
+//! - list_branches    本地 + 远程分支列表
+//! - get_log          提交历史（带分支/标签引用）
+//! - get_commit_files 单提交的改动文件列表
+//! - get_diff         单提交的 unified diff 文本
+//! - get_head_tree    HEAD 提交的已跟踪文件列表（文件树数据源）
+//! - get_status       工作区状态（未暂存/已暂存/未跟踪）
+//!
+//! git2 使用 default-features=false（无 ssh/https/openssl），只做本地操作。
+
+use git2::{BranchType, DiffFormat, ObjectType, Oid, Repository, Sort, TreeWalkResult};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+struct AppState {
+    repo: Mutex<Option<Repository>>,
+}
+
+// ---------- 数据结构（serde camelCase，前端 TS 直接对应） ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoSummary {
+    path: String,
+    name: String,
+    current_branch: Option<String>,
+    is_empty: bool,
+    head_commit: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchInfo {
+    name: String,
+    is_head: bool,
+    is_remote: bool,
+    upstream: Option<String>,
+    commit: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInfo {
+    oid: String,
+    short: String,
+    summary: String,
+    author: String,
+    email: String,
+    time: i64,
+    parents: Vec<String>,
+    refs: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileChange {
+    path: String,
+    status: String,
+    old_path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusItem {
+    path: String,
+    status: String,
+}
+
+fn to_err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+/// 从 state 取仓库，处理锁 + None 两种情况，减少每个命令的样板代码
+macro_rules! with_repo {
+    ($state:expr, $repo:ident, $body:block) => {{
+        let guard = $state.repo.lock().map_err(to_err)?;
+        let $repo = guard.as_ref().ok_or("尚未打开仓库")?;
+        $body
+    }};
+}
+
+// ---------- Tauri 命令 ----------
+
+#[tauri::command]
+fn open_repo(state: tauri::State<AppState>, path: String) -> Result<RepoSummary, String> {
+    let repo = Repository::open(&path).map_err(to_err)?;
+    let name = repo
+        .workdir()
+        .or_else(|| repo.path().parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let is_empty = repo.is_empty().map_err(to_err)?;
+
+    // head 引用借用 repo，先在块内提取 owned 值并随块结束 drop，之后才能 move repo 进 state
+    let (current_branch, head_commit) = {
+        let head = repo.head().ok();
+        let current_branch = head
+            .as_ref()
+            .filter(|h| h.is_branch())
+            .and_then(|h| h.shorthand().map(|s| s.to_string()));
+        let head_commit = head
+            .as_ref()
+            .and_then(|h| h.target().map(|o| o.to_string()));
+        (current_branch, head_commit)
+    };
+
+    *state.repo.lock().map_err(to_err)? = Some(repo);
+    Ok(RepoSummary {
+        path,
+        name,
+        current_branch,
+        is_empty,
+        head_commit,
+    })
+}
+
+#[tauri::command]
+fn list_branches(state: tauri::State<AppState>) -> Result<Vec<BranchInfo>, String> {
+    with_repo!(state, repo, {
+        let mut out = Vec::new();
+        for item in repo.branches(None).map_err(to_err)? {
+            let (branch, btype) = item.map_err(to_err)?;
+            let name = branch
+                .name()
+                .map_err(to_err)?
+                .unwrap_or("?")
+                .to_string();
+            let commit = branch
+                .get()
+                .target()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+            let upstream = if btype == BranchType::Local {
+                branch
+                    .upstream()
+                    .ok()
+                    .and_then(|u| u.name().ok().flatten().map(|s| s.to_string()))
+            } else {
+                None
+            };
+            out.push(BranchInfo {
+                name,
+                is_head: branch.is_head(),
+                is_remote: btype == BranchType::Remote,
+                upstream,
+                commit,
+            });
+        }
+        Ok(out)
+    })
+}
+
+#[tauri::command]
+fn get_log(state: tauri::State<AppState>, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    with_repo!(state, repo, {
+        // 先建 ref 映射：oid -> [分支名/远程分支名]，用于在 log 行上打标签
+        let mut refmap: HashMap<String, Vec<String>> = HashMap::new();
+        for item in repo.branches(None).map_err(to_err)? {
+            let (branch, _btype) = item.map_err(to_err)?;
+            if let (Some(oid), Ok(Some(name))) = (
+                branch.get().target(),
+                branch.name().map(|n| n.map(|s| s.to_string())),
+            ) {
+                refmap.entry(oid.to_string()).or_default().push(name);
+            }
+        }
+
+        let mut revwalk = repo.revwalk().map_err(to_err)?;
+        revwalk.push_head().map_err(to_err)?;
+        revwalk
+            .set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
+            .map_err(to_err)?;
+
+        let mut out = Vec::new();
+        for oid_res in revwalk.take(limit) {
+            let oid = oid_res.map_err(to_err)?;
+            let commit = repo.find_commit(oid).map_err(to_err)?;
+            out.push(CommitInfo {
+                oid: oid.to_string(),
+                short: oid.to_string().chars().take(7).collect(),
+                summary: commit.summary().unwrap_or("").to_string(),
+                author: commit.author().name().unwrap_or("").to_string(),
+                email: commit.author().email().unwrap_or("").to_string(),
+                time: commit.time().seconds(),
+                parents: commit.parent_ids().map(|o| o.to_string()).collect(),
+                refs: refmap.remove(&oid.to_string()).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    })
+}
+
+/// 取提交与其第一父提交的 tree diff；根提交与空树 diff
+fn commit_diff<'r>(repo: &'r Repository, oid: &str) -> Result<git2::Diff<'r>, String> {
+    let oid = Oid::from_str(oid).map_err(to_err)?;
+    let commit = repo.find_commit(oid).map_err(to_err)?;
+    let new_tree = commit.tree().map_err(to_err)?;
+    let old_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(to_err)?.tree().map_err(to_err)?)
+    } else {
+        None
+    };
+    repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
+        .map_err(to_err)
+}
+
+#[tauri::command]
+fn get_commit_files(state: tauri::State<AppState>, oid: String) -> Result<Vec<FileChange>, String> {
+    with_repo!(state, repo, {
+        let diff = commit_diff(repo, &oid)?;
+        let mut out = Vec::new();
+        for delta in diff.deltas() {
+            let status = match delta.status() {
+                git2::Delta::Added => "added",
+                git2::Delta::Deleted => "deleted",
+                git2::Delta::Modified => "modified",
+                git2::Delta::Renamed => "renamed",
+                git2::Delta::Copied => "copied",
+                git2::Delta::Typechange => "typechange",
+                _ => "other",
+            }
+            .to_string();
+            out.push(FileChange {
+                path: delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                status,
+                old_path: delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
+            });
+        }
+        Ok(out)
+    })
+}
+
+#[tauri::command]
+fn get_diff(state: tauri::State<AppState>, oid: String) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let diff = commit_diff(repo, &oid)?;
+        let mut buf = String::new();
+        diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+            match line.origin() {
+                // 增删/上下文行：带前缀输出
+                '+' | '-' | ' ' => {
+                    buf.push(line.origin());
+                    buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+                }
+                // 文件头：转成我们自己的分隔行，前端好按文件分段渲染
+                'F' => {
+                    if let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy()) {
+                        buf.push_str(&format!("\n=== {path} ===\n"));
+                    }
+                }
+                // 其余（hunk 头 @@、index 行等）原样输出
+                _ => buf.push_str(std::str::from_utf8(line.content()).unwrap_or("")),
+            }
+            true
+        })
+        .map_err(to_err)?;
+        Ok(buf)
+    })
+}
+
+#[tauri::command]
+fn get_head_tree(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    with_repo!(state, repo, {
+        let commit = repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?;
+        let tree = commit.tree().map_err(to_err)?;
+        let mut paths = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(ObjectType::Blob) {
+                paths.push(format!("{}{}", root, entry.name().unwrap_or("")));
+            }
+            TreeWalkResult::Ok
+        })
+        .map_err(to_err)?;
+        paths.sort();
+        Ok(paths)
+    })
+}
+
+#[tauri::command]
+fn get_status(state: tauri::State<AppState>) -> Result<Vec<StatusItem>, String> {
+    with_repo!(state, repo, {
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true);
+        let statuses = repo.statuses(Some(&mut opts)).map_err(to_err)?;
+        let mut out = Vec::new();
+        for entry in statuses.iter() {
+            let path = entry.path().unwrap_or("?").to_string();
+            let s = entry.status();
+            let status = if s.is_wt_new() || s.is_index_new() {
+                "added"
+            } else if s.is_wt_modified() || s.is_index_modified() {
+                "modified"
+            } else if s.is_wt_deleted() || s.is_index_deleted() {
+                "deleted"
+            } else if s.is_wt_renamed() || s.is_index_renamed() {
+                "renamed"
+            } else {
+                "other"
+            }
+            .to_string();
+            out.push(StatusItem { path, status });
+        }
+        Ok(out)
+    })
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .manage(AppState {
+            repo: Mutex::new(None),
+        })
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            open_repo,
+            list_branches,
+            get_log,
+            get_commit_files,
+            get_diff,
+            get_head_tree,
+            get_status,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

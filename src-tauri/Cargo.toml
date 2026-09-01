@@ -1,0 +1,28 @@
+[package]
+name = "gitmanage"
+version = "0.1.0"
+description = "Lightweight Git manager for Windows 11"
+authors = ["guohj"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "gitmanage_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# default-features=false：关掉 ssh/https/openssl，v0.1 只做本地仓库（log/diff/branch），
+# 避免 openssl-sys / libssh2 的编译坑，远程推拉后续用 git CLI 侧车实现。
+git2 = { version = "0.20", default-features = false }
+
