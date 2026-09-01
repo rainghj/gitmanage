@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
@@ -47,6 +47,7 @@ interface RecentEntry {
   path: string;
   name: string;
   lastOpened: number;
+  exists: boolean;
 }
 
 interface StashEntry {
@@ -271,6 +272,9 @@ function App() {
   const [consoleText, setConsoleText] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [opBusy, setOpBusy] = useState<string | null>(null); // 当前正在执行的远程操作
+  const [pathMenuOpen, setPathMenuOpen] = useState(false); // 路径显示框（已开仓库时）点击弹出的统一菜单
+  const [recentMenuIndex, setRecentMenuIndex] = useState(0); // 菜单里键盘高亮的那一项
+  const pathMenuRef = useRef<HTMLDivElement>(null); // 包住显示框 + 菜单的容器
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -296,24 +300,30 @@ function App() {
     }
   }, [repo, filterBranch, filterQuery]);
 
-  async function openRepo(pathOverride?: string) {
-    const path = (pathOverride ?? repoPath).trim();
+// 打开仓库。路径一律显式传入（浏览…/最近列表/示例链接），输入框只做展示不承接输入
+  async function openRepo(path: string) {
+    path = path.trim();
     if (!path) return;
     setLoading(true);
     setError("");
     try {
       const summary = await invoke<RepoSummary>("open_repo", { path });
       setRepo(summary);
-      // 回填真实仓库根：选中子目录时 Rust 侧会向上找到 .git，输入框显示实际根目录
+      // 回填真实仓库根：选中子目录时 Rust 侧会向上找到 .git，显示框展示实际根目录
       setRepoPath(summary.path);
       setSelected(null);
       setFiles([]);
       setDiff("");
-      // 异步记一条最近打开，失败不阻塞主流程
-      invoke("add_recent", { path: summary.path }).catch(() => {});
+      setPathMenuOpen(false);
+      // 异步记一条最近打开，失败不阻塞主流程；成功后刷新最近列表，更新菜单和欢迎页
+      invoke("add_recent", { path: summary.path })
+        .then(loadRecent)
+        .catch(() => {});
     } catch (e) {
       setError(String(e));
       setRepo(null);
+      // 打开失败会退回欢迎页，但后端可能仍持有上一个仓库的句柄（文件锁残留），主动释放
+      invoke("close_repo").catch(() => {});
     } finally {
       setLoading(false);
     }
@@ -332,6 +342,85 @@ function App() {
     if (path) await openRepo(path);
   }
 
+  // 关闭当前仓库：先叫 Rust 释放 git2 句柄（不然后端一直占着 .git 文件锁），
+  // 然后清空所有相关状态返回欢迎页
+  async function closeRepo() {
+    try {
+      await invoke("close_repo");
+    } catch (e) {
+      setError(String(e));
+      return; // 释放失败别继续，否则前端状态和后端会脱钩
+    }
+    setRepo(null);
+    setBranches([]);
+    setCommits([]);
+    setTree([]);
+    setStatus([]);
+    setStashes([]);
+    setSelected(null);
+    setFiles([]);
+    setDiff("");
+    setFilterBranch("");
+    setFilterQuery("");
+    setCommitMsg("");
+    setConsoleText("");
+    setConsoleOpen(false);
+    setRepoPath("");
+    setPathMenuOpen(false);
+  }
+
+  // 点击菜单外部关闭
+  useEffect(() => {
+    if (!pathMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (pathMenuRef.current && !pathMenuRef.current.contains(e.target as Node)) {
+        setPathMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [pathMenuOpen]);
+
+  // 键盘导航：↑↓ 移动高亮、Enter 打开、Esc 关闭；并把高亮项滚动进可视区
+  useEffect(() => {
+    if (!pathMenuOpen) return;
+    const items = recent;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setPathMenuOpen(false);
+        return;
+      }
+      if (items.length === 0) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setRecentMenuIndex((i) => (i + 1) % items.length);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setRecentMenuIndex((i) => (i - 1 + items.length) % items.length);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const r = items[recentMenuIndex];
+        if (!r) return;
+        setPathMenuOpen(false);
+        if (r.path === repo?.path) return;
+        if (!r.exists) {
+          setError(`路径不存在：${r.path}`);
+          return;
+        }
+        openRepo(r.path);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+
+    // 滚动到高亮项（block: nearest 防止列表被甩出去）
+    const el = pathMenuRef.current?.querySelector<HTMLElement>(
+      `[data-idx="${recentMenuIndex}"]`,
+    );
+    el?.scrollIntoView({ block: "nearest" });
+
+    return () => document.removeEventListener("keydown", onKey);
+  }, [pathMenuOpen, recent, recentMenuIndex, repo]);
+
   // 过滤变更时 300ms 防抖：避免每个字符发一次 RPC
   const debouncedQuery = useDebounced(filterQuery, 300);
   const debouncedBranch = useDebounced(filterBranch, 300);
@@ -340,17 +429,19 @@ function App() {
     refresh();
   }, [refresh, debouncedQuery, debouncedBranch]);
 
-  // 没打开仓库时拉一次最近列表（点开仓库后切到主视图，回到首页才需要重新拉）
+  // 每次 repo 变化（或首次挂载）都拉一次最近列表：欢迎页用它渲染，顶部栏下拉菜单也用
+  const loadRecent = useCallback(async () => {
+    try {
+      setRecent(await invoke<RecentEntry[]>("get_recent"));
+    } catch {
+      // 拉取失败就清空，不影响主流程
+    }
+  }, []);
+
+  // 仓库切换（含关闭回到首页）时重新拉最近列表
   useEffect(() => {
-    if (repo) return;
-    (async () => {
-      try {
-        setRecent(await invoke<RecentEntry[]>("get_recent"));
-      } catch {
-        // 拉取失败就清空，不影响主流程
-      }
-    })();
-  }, [repo]);
+    loadRecent();
+  }, [repo, loadRecent]);
 
   // ---------- 分支 / 提交操作 ----------
 
@@ -463,22 +554,132 @@ function App() {
       {/* 顶部栏 */}
       <header className="topbar">
         <span className="logo">GitManage</span>
-        <input
-          className="repo-input"
-          placeholder="仓库路径，或直接点「浏览…」选择（支持选中仓库内任意子目录）"
-          value={repoPath}
-          onChange={(e) => setRepoPath(e.currentTarget.value)}
-          onKeyDown={(e) => e.key === "Enter" && openRepo()}
-        />
-        <button className="ghost" onClick={browseFolder} disabled={loading} title="弹出文件夹选择器">
+        <div className="path-menu-wrap" ref={pathMenuRef}>
+          {/* 纯展示框：只显示当前仓库路径。开仓库走「浏览…」/ 最近列表，这里不承接输入 */}
+          <input
+            className={"repo-input" + (repo ? " has-repo" : "")}
+            placeholder="点「浏览…」选择仓库目录，或从最近打开中选择"
+            value={repoPath}
+            readOnly
+            onClick={() => {
+              // 已开仓库时点显示框弹统一菜单
+              if (repo) {
+                const next = !pathMenuOpen;
+                setPathMenuOpen(next);
+                if (next) {
+                  const idx = recent.findIndex((r) => r.path === repo.path);
+                  setRecentMenuIndex(idx >= 0 ? idx : 0);
+                }
+              }
+            }}
+            title={repo ? "点击打开仓库菜单（切换 / 在资源管理器中打开 / 复制路径）" : "点「浏览…」选择仓库目录"}
+          />
+          {repo && pathMenuOpen && (
+            <div className="recent-menu path-menu" role="menu">
+              {/* 当前仓库信息 */}
+              <div className="path-menu-head">
+                <div className="path-menu-name">📁 {repo.name}</div>
+                <div className="path-menu-sub" title={repo.path}>
+                  {repo.path}
+                </div>
+              </div>
+              {/* 仓库级快捷动作 */}
+              <button
+                className="recent-menu-item"
+                onClick={async () => {
+                  setPathMenuOpen(false);
+                  try {
+                    await invoke("reveal_in_explorer", { path: repo.path });
+                  } catch (e) {
+                    setError(String(e));
+                  }
+                }}
+              >
+                📂 在资源管理器中打开
+              </button>
+              <button
+                className="recent-menu-item"
+                onClick={async () => {
+                  setPathMenuOpen(false);
+                  try {
+                    await navigator.clipboard.writeText(repo.path);
+                  } catch {
+                    setError("复制失败：剪贴板不可用");
+                  }
+                }}
+              >
+                ⧉ 复制路径
+              </button>
+              {/* 切换到最近打开的仓库 */}
+              <div className="recent-menu-sep" />
+              <div className="recent-menu-title">
+                切换到 <span className="recent-menu-hint">↑↓ 选择 · Enter · Esc</span>
+              </div>
+              {recent.length === 0 && <div className="recent-menu-empty">暂无记录</div>}
+              {recent.map((r, idx) => {
+                const isCurrent = r.path === repo.path;
+                return (
+                  <button
+                    key={r.path}
+                    data-idx={idx}
+                    className={`recent-menu-item ${r.exists ? "" : "missing"} ${isCurrent ? "current" : ""} ${idx === recentMenuIndex ? "active" : ""}`}
+                    // 鼠标移上来同步键盘高亮，让鼠标/键盘两种操作一致
+                    onMouseEnter={() => setRecentMenuIndex(idx)}
+                    onClick={() => {
+                      setPathMenuOpen(false);
+                      if (isCurrent) return;
+                      if (!r.exists) {
+                        setError(`路径不存在：${r.path}`);
+                        return;
+                      }
+                      openRepo(r.path);
+                    }}
+                    title={r.exists ? r.path : `${r.path}（路径不存在）`}
+                  >
+                    <span className="recent-menu-dot">{isCurrent ? "●" : "○"}</span>
+                    <div className="recent-menu-text">
+                      <div className="recent-menu-name">{r.name}</div>
+                      <div className="recent-menu-path">{r.path}</div>
+                    </div>
+                    <span className="recent-menu-time">
+                      {r.exists ? formatRelative(r.lastOpened) : "不存在"}
+                    </span>
+                  </button>
+                );
+              })}
+              {recent.length > 0 && (
+                <>
+                  <div className="recent-menu-sep" />
+                  <button
+                    className="recent-menu-item ghost-flat"
+                    onClick={() => {
+                      setPathMenuOpen(false);
+                      closeRepo();
+                    }}
+                  >
+                    ✕ 关闭当前仓库，回到欢迎页
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        <button
+          className={repo ? "ghost" : ""}
+          onClick={browseFolder}
+          disabled={loading}
+          title="弹出文件夹选择器（支持选中仓库内任意子目录）"
+        >
           浏览…
-        </button>
-        <button onClick={() => openRepo()} disabled={loading}>
-          {loading ? "打开中…" : "打开仓库"}
         </button>
         {repo && (
           <button className="ghost" onClick={refresh}>
             刷新
+          </button>
+        )}
+        {repo && (
+          <button className="ghost" onClick={closeRepo} title="关闭当前仓库，回到欢迎页">
+            关闭
           </button>
         )}
         {current && (
@@ -527,9 +728,9 @@ function App() {
 
       {!repo ? (
         <div className="welcome">
-          <h2>输入仓库路径开始</h2>
+          <h2>选择仓库目录开始</h2>
           <p className="welcome-hint">
-            也可以点右上角「浏览…」选目录（支持选中仓库内任意子目录）。
+            点右上角「浏览…」选择目录（支持选中仓库内任意子目录）。
           </p>
 
           {recent.length > 0 && (
@@ -537,36 +738,77 @@ function App() {
               <div className="recent-title">最近打开</div>
               <ul className="recent-list">
                 {recent.map((r) => (
-                  <li key={r.path} className="recent-item">
+                  <li
+                    key={r.path}
+                    className={`recent-item ${r.exists ? "" : "missing"}`}
+                    title={r.exists ? r.path : `${r.path}（路径不存在）`}
+                  >
                     <button
                       className="recent-main"
-                      title={r.path}
-                      onClick={() => openRepo(r.path)}
+                      title={r.exists ? r.path : `${r.path}（路径不存在）`}
+                      onClick={() => {
+                        if (!r.exists) {
+                          setError(`路径不存在：${r.path}`);
+                          return;
+                        }
+                        openRepo(r.path);
+                      }}
                     >
-                      <span className="recent-icon">📁</span>
+                      <span className="recent-icon">{r.exists ? "📁" : "⚠"}</span>
                       <div className="recent-meta">
                         <div className="recent-name">{r.name}</div>
                         <div className="recent-path">{r.path}</div>
                       </div>
                       <span className="recent-time">
-                        {formatRelative(r.lastOpened)}
+                        {r.exists ? formatRelative(r.lastOpened) : "不存在"}
                       </span>
                     </button>
-                    <button
-                      className="recent-remove"
-                      title="从列表中移除"
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        try {
-                          await invoke("remove_recent", { path: r.path });
-                          setRecent((prev) => prev.filter((x) => x.path !== r.path));
-                        } catch (err) {
-                          setError(String(err));
-                        }
-                      }}
-                    >
-                      ×
-                    </button>
+                    <div className="recent-tools">
+                      <button
+                        className="recent-tool"
+                        title="在 Windows 资源管理器中打开"
+                        disabled={!r.exists}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await invoke("reveal_in_explorer", { path: r.path });
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                      >
+                        📂
+                      </button>
+                      <button
+                        className="recent-tool"
+                        title="复制路径"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await navigator.clipboard.writeText(r.path);
+                          } catch {
+                            setError("复制失败：浏览器剪贴板不可用");
+                          }
+                        }}
+                      >
+                        ⧉
+                      </button>
+                      <button
+                        className="recent-remove"
+                        title="从列表中移除"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await invoke("remove_recent", { path: r.path });
+                            setRecent((prev) => prev.filter((x) => x.path !== r.path));
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>

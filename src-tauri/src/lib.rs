@@ -32,6 +32,10 @@ struct RecentEntry {
     path: String,
     name: String,
     last_opened: i64, // unix 秒
+    /// 路径仍存在于磁盘（frontend 会据此灰显）。`#[serde(default)]` 保证旧版 recent.json
+    /// （没有此字段）也能正常解析，不会把历史记录一次性清空。
+    #[serde(default)]
+    exists: bool,
 }
 
 /// 存到 AppData 下的配置目录（Windows: %APPDATA%\com.guohj.gitmanage\）
@@ -171,6 +175,15 @@ fn open_repo(state: tauri::State<AppState>, path: String) -> Result<RepoSummary,
         is_empty,
         head_commit,
     })
+}
+
+/// 关闭当前仓库：把 state 里的 Repository 置 None 以释放 git2 句柄。
+/// 必须走这个命令而不是只在前端把 repo 状态清空——否则 Rust 侧仍持有 .git 的文件锁，
+/// Windows 上表现为：其他 git 命令 / 资源管理器删除该目录会被拒绝访问。
+#[tauri::command]
+fn close_repo(state: tauri::State<AppState>) -> Result<(), String> {
+    *state.repo.lock().map_err(to_err)? = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -600,7 +613,12 @@ fn git_remote_op(
 
 #[tauri::command]
 fn get_recent(app: tauri::AppHandle) -> Vec<RecentEntry> {
+    // 返回前按当前磁盘情况计算 exists —— 文件被移动/删除后再次打开 UI 会有直观显示，
+    // 注意这里只 inspect 路径是否存在，不会去 find_commit（避免对有问题的仓库报红）。
     let mut list = read_recent(&app);
+    for e in &mut list {
+        e.exists = std::path::Path::new(&e.path).exists();
+    }
     list.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
     list
 }
@@ -624,6 +642,7 @@ fn add_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
             path,
             name,
             last_opened: now,
+            exists: true, // 刚打开必存在
         },
     );
     list.truncate(RECENT_LIMIT);
@@ -635,6 +654,29 @@ fn remove_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let mut list = read_recent(&app);
     list.retain(|e| !e.path.eq_ignore_ascii_case(&path));
     write_recent(&app, &list)
+}
+
+/// 在 Windows 资源管理器中打开路径。
+/// 目录：直接进入该目录（explorer <dir>）；文件：打开所在目录并选中它（/select）。
+/// 注意不能用 /select 打开目录——那会停在父目录只做高亮，用户会以为"没打开"。
+/// explorer 是"软失败"型进程（exit code 不可靠），用 spawn 即可。
+#[tauri::command]
+fn reveal_in_explorer(path: String) -> Result<(), String> {
+    use std::path::Path;
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {path}"));
+    }
+    let arg = if p.is_file() {
+        format!("/select,{}", p.display())
+    } else {
+        p.display().to_string()
+    };
+    std::process::Command::new("explorer")
+        .arg(arg)
+        .spawn()
+        .map_err(|e| format!("无法启动 explorer: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -698,6 +740,8 @@ pub fn run() {
             get_recent,
             add_recent,
             remove_recent,
+            reveal_in_explorer,
+            close_repo,
             git_remote_op,
             stash_list,
             stash_save,

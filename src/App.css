@@ -71,6 +71,62 @@ body {
   border-color: var(--accent-2);
 }
 
+/* ---------- 顶部栏路径输入框统一入口 ---------- */
+
+.path-menu-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-width: 0;
+}
+
+.path-menu-wrap .repo-input {
+  width: 100%;
+}
+
+/* 只读展示态：深一档底色，与可输入控件区分 */
+.repo-input[readonly] {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+/* 已开仓库时可点击弹菜单（欢迎页点了没动作，不给 pointer） */
+.repo-input[readonly].has-repo {
+  cursor: pointer;
+}
+
+.repo-input[readonly].has-repo:hover {
+  border-color: var(--accent-2);
+}
+
+/* 菜单锚定在输入框下方，比通用 .recent-menu 稍宽以容纳完整路径 */
+.path-menu {
+  left: 0;
+  right: auto;
+  width: min(480px, 90vw);
+}
+
+.path-menu-head {
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.path-menu-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.path-menu-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: Consolas, "Courier New", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 button {
   background: var(--accent-2);
   color: #fff;
@@ -232,6 +288,56 @@ button.link {
 .recent-remove:hover {
   background: var(--red);
   color: #fff;
+}
+
+/* hover 时整体淡入的快捷工具栏：默认隐藏，只露 ×；hover 露出 📂 / ⧉ 两个额外按钮 */
+.recent-tools {
+  display: flex;
+  align-items: stretch;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.recent-item:hover .recent-tools,
+.recent-item:focus-within .recent-tools {
+  opacity: 1;
+}
+
+.recent-tool {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: 0 10px;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.recent-tool:hover {
+  background: var(--panel-2);
+  color: var(--accent);
+}
+
+.recent-tool:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* 路径已被移动/删除 → 灰显 + 警告条纹 */
+.recent-item.missing {
+  border-color: #5a3030;
+  background: #2a2226;
+}
+
+.recent-item.missing .recent-name,
+.recent-item.missing .recent-path {
+  color: #8a7575;
+  text-decoration: line-through;
+  text-decoration-color: #5a3030;
+}
+
+.recent-item.missing .recent-time {
+  color: var(--red);
 }
 
 .welcome {
@@ -683,6 +789,160 @@ button.ghost.small {
   gap: 4px;
   align-items: center;
   margin-left: auto; /* 推到右侧 */
+}
+
+/* ---------- 顶部栏「最近」下拉 ---------- */
+
+.recent-menu-wrap {
+  position: relative;
+}
+
+.recent-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 100;
+  width: 360px;
+  max-height: 380px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.recent-menu-title {
+  padding: 6px 10px 4px;
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.recent-menu-hint {
+  font-family: Consolas, "Courier New", monospace;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.recent-menu-empty {
+  padding: 18px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.recent-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+.recent-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.recent-menu-item:hover {
+  background: var(--panel);
+}
+
+/* 键盘高亮——比 hover 优先级更高（用 outline 不挤占布局）*/
+.recent-menu-item.active {
+  outline: 1px solid var(--accent-2);
+  outline-offset: -1px;
+  background: var(--panel);
+}
+
+.recent-menu-item.active.current {
+  background: #094771;
+}
+
+.recent-menu-item.missing {
+  opacity: 0.55;
+}
+
+.recent-menu-item.missing .recent-menu-name,
+.recent-menu-item.missing .recent-menu-path {
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+}
+
+.recent-menu-item.current {
+  background: #094771;
+  color: #fff;
+}
+
+.recent-menu-item.current .recent-menu-dot {
+  color: var(--accent);
+}
+
+.recent-menu-item.ghost-flat {
+  color: var(--text-dim);
+  font-size: 12px;
+  justify-content: center;
+  padding: 8px 10px;
+  border-top: 1px solid transparent;
+}
+
+.recent-menu-item.ghost-flat:hover {
+  color: var(--red);
+}
+
+.recent-menu-dot {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.recent-menu-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.recent-menu-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-menu-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: Consolas, "Courier New", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 1px;
+}
+
+.recent-menu-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-dim);
 }
 
 /* ---------- 控制台面板 ---------- */
