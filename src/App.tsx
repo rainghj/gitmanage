@@ -237,6 +237,19 @@ function CommitGraph({ row, laneCount, isLast }: { row: GraphRow; laneCount: num
 
 // ---------- diff 渲染 ----------
 
+// 从整段 commit diff 中抽出单个文件的部分（patch_to_string 用 === path === 做文件分隔行）
+function extractFileDiff(full: string, path: string): string {
+  const lines = full.split("\n");
+  const out: string[] = [];
+  let take = false;
+  for (const line of lines) {
+    const m = line.match(/^=== (.+) ===$/);
+    if (m) take = m[1] === path;
+    if (take) out.push(line);
+  }
+  return out.join("\n").trim();
+}
+
 function DiffView({ text, hint = "选择左侧提交查看改动" }: { text: string; hint?: string }) {
   if (!text) return <div className="empty-hint">{hint}</div>;
   return (
@@ -323,6 +336,8 @@ function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [files, setFiles] = useState<FileChange[]>([]);
   const [diff, setDiff] = useState("");
+  // 右栏「改动文件」里选中的文件：非空时差异区只显示该文件的 diff，再点一次恢复全部
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
@@ -767,6 +782,7 @@ function App() {
       setDiff("");
       return;
     }
+    setSelectedFile(null); // 换提交时清掉文件级筛选
     (async () => {
       try {
         const [fs, d] = await Promise.all([
@@ -1485,10 +1501,24 @@ function App() {
             )}
             <div className="pane-title">
               改动文件（{files.length}）
+              {selectedFile && (
+                <button
+                  className="ghost small pane-title-btn"
+                  title="恢复显示全部文件的差异"
+                  onClick={() => setSelectedFile(null)}
+                >
+                  显示全部
+                </button>
+              )}
             </div>
             <div className="pane-body change-list">
               {files.map((f) => (
-                <div key={f.path} className="status-item" title={f.oldPath ? `${f.oldPath} → ${f.path}` : f.path}>
+                <div
+                  key={f.path}
+                  className={`status-item clickable ${selectedFile === f.path ? "selected" : ""}`}
+                  title={`${f.oldPath ? `${f.oldPath} → ${f.path}` : f.path}（点击只看此文件的差异）`}
+                  onClick={() => setSelectedFile(selectedFile === f.path ? null : f.path)}
+                >
                   <span className={`status-badge st-${f.status}`}>
                     {STATUS_LABEL[f.status] ?? "?"}
                   </span>
@@ -1497,9 +1527,9 @@ function App() {
               ))}
               {selected && files.length === 0 && <div className="empty-hint">无文件改动</div>}
             </div>
-            <div className="pane-title">差异</div>
+            <div className="pane-title">差异{selectedFile ? ` · ${selectedFile}` : ""}</div>
             <div className="pane-body diff-body">
-              <DiffView text={diff} />
+              <DiffView text={selectedFile ? extractFileDiff(diff, selectedFile) : diff} />
             </div>
           </section>
           )}

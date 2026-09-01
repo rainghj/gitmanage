@@ -856,6 +856,18 @@ button.ghost.small {
   cursor: pointer;
 }
 
+/* 右栏改动文件列表的选中态（点击只看该文件差异） */
+.status-item.selected {
+  background: #094771;
+}
+
+/* pane-title 里的小按钮（如「显示全部」），抵消标题的大写/字距 */
+.pane-title-btn {
+  margin-left: 8px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
 /* 更改条目的提交勾选框 */
 .status-check {
   flex-shrink: 0;
