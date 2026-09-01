@@ -441,6 +441,12 @@ button.link {
   cursor: default;
 }
 
+/* 目录可折叠/展开，文件可点击预览 */
+.tree-label.dir,
+.tree-label.file {
+  cursor: pointer;
+}
+
 .tree-label:hover {
   background: var(--panel-2);
 }

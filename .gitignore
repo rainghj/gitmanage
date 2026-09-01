@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 
 .workbuddy/
+
+# 会话/工具临时文件
+_tmp_*

@@ -124,23 +124,41 @@ function FileTreeView({
   return (
     <ul className="file-tree" style={{ paddingLeft: depth === 0 ? 0 : 14 }}>
       {nodes.map((n) => (
-        <li key={n.path}>
-          <span
-            className={`tree-label ${n.isFile ? "file" : "dir"}`}
-            onClick={() => n.isFile && onFileClick?.(n.path)}
-            title={n.isFile ? `${n.path}（点击在中栏预览）` : n.path}
-          >
-            <span className={`tree-icon ${n.isFile ? "file" : "dir"}`}>
-              {n.isFile ? "📄" : "📁"}
-            </span>
-            {n.name}
-          </span>
-          {n.children.length > 0 && (
-            <FileTreeView nodes={n.children} depth={depth + 1} onFileClick={onFileClick} />
-          )}
-        </li>
+        <TreeNodeRow key={n.path} node={n} depth={depth} onFileClick={onFileClick} />
       ))}
     </ul>
+  );
+}
+
+// 单个树节点：目录自带折叠状态（默认展开，key=path 保证 refresh 后状态保留）
+function TreeNodeRow({
+  node: n,
+  depth,
+  onFileClick,
+}: {
+  node: TreeNode;
+  depth: number;
+  onFileClick?: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <li>
+      <span
+        className={`tree-label ${n.isFile ? "file" : "dir"}`}
+        onClick={() => (n.isFile ? onFileClick?.(n.path) : setOpen((o) => !o))}
+        title={
+          n.isFile ? `${n.path}（点击在中栏预览）` : `${n.path}（点击${open ? "折叠" : "展开"}）`
+        }
+      >
+        <span className={`tree-icon ${n.isFile ? "file" : "dir"}`}>
+          {n.isFile ? "📄" : open ? "▾ 📁" : "▸ 📁"}
+        </span>
+        {n.name}
+      </span>
+      {open && n.children.length > 0 && (
+        <FileTreeView nodes={n.children} depth={depth + 1} onFileClick={onFileClick} />
+      )}
+    </li>
   );
 }
 

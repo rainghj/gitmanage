@@ -672,18 +672,33 @@ fn set_skip(state: tauri::State<AppState>, path: String, skip: bool) -> Result<V
     })
 }
 
-/// 只暂存指定路径（文件级勾选提交用）。已删除的文件走 remove_path 从索引移除。
+/// 只暂存指定路径（文件级勾选提交用）。
+/// 删除判定不能只看磁盘是否存在——「停止跟踪」（git rm --cached）的文件磁盘上还在，
+/// 但状态是 INDEX_DELETED，这种情况必须 remove_path 保持不跟踪，否则会被重新加回。
 #[tauri::command]
 fn stage_files(state: tauri::State<AppState>, paths: Vec<String>) -> Result<usize, String> {
     with_repo!(state, repo, {
         let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        // 先收集所有"删除态"路径（索引删除 = 停止跟踪；工作区删除 = 文件没了）
+        let mut dels = std::collections::HashSet::new();
+        let sts = repo.statuses(None).map_err(to_err)?;
+        for e in sts.iter() {
+            if e
+                .status()
+                .intersects(git2::Status::INDEX_DELETED | git2::Status::WT_DELETED)
+            {
+                if let Some(p) = e.path() {
+                    dels.insert(p.to_string());
+                }
+            }
+        }
         let mut index = repo.index().map_err(to_err)?;
         for p in &paths {
             let rel = std::path::Path::new(p);
-            if workdir.join(rel).exists() {
-                index.add_path(rel).map_err(to_err)?;
-            } else {
+            if dels.contains(p) || !workdir.join(rel).exists() {
                 index.remove_path(rel).map_err(to_err)?;
+            } else {
+                index.add_path(rel).map_err(to_err)?;
             }
         }
         index.write().map_err(to_err)?;
