@@ -611,6 +611,47 @@ fn git_remote_op(
     })
 }
 
+/// 读取指定远程（默认 origin）的 URL，用于「设置远程」弹层预填；未配置时返回 None。
+#[tauri::command]
+fn get_remote_url(state: tauri::State<AppState>, name: Option<String>) -> Result<Option<String>, String> {
+    with_repo!(state, repo, {
+        let n = name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "origin".to_string());
+        // match 必须先落到 let：块尾表达式里的 match 临时量（Remote 借用了 guard）
+        // 会在 guard 之后才析构，触发 E0597
+        let url = match repo.find_remote(&n) {
+            Ok(r) => r.url().map(|u| u.to_string()),
+            Err(_) => None,
+        };
+        Ok(url)
+    })
+}
+
+/// 设置远程仓库地址：已存在同名远程则改 URL（等价 git remote set-url），
+/// 不存在则新建（等价 git remote add）。纯配置操作，不走网络，所以直接用 git2 而不走 CLI 侧车。
+#[tauri::command]
+fn set_remote_url(state: tauri::State<AppState>, url: String, name: Option<String>) -> Result<String, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("远程地址不能为空".to_string());
+    }
+    with_repo!(state, repo, {
+        let n = name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "origin".to_string());
+        if repo.find_remote(&n).is_ok() {
+            repo.remote_set_url(&n, &url).map_err(to_err)?;
+            Ok(format!("已更新远程 {n} → {url}"))
+        } else {
+            repo.remote(&n, &url).map_err(to_err)?;
+            Ok(format!("已添加远程 {n} → {url}"))
+        }
+    })
+}
+
 #[tauri::command]
 fn get_recent(app: tauri::AppHandle) -> Vec<RecentEntry> {
     // 返回前按当前磁盘情况计算 exists —— 文件被移动/删除后再次打开 UI 会有直观显示，
@@ -746,6 +787,8 @@ pub fn run() {
             reveal_in_explorer,
             close_repo,
             git_remote_op,
+            get_remote_url,
+            set_remote_url,
             stash_list,
             stash_save,
             stash_pop,

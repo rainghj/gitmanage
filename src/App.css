@@ -682,6 +682,33 @@ button.ghost.small {
   flex-shrink: 0;
 }
 
+/* 「设置远程」展开的输入行 */
+.remote-edit {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+}
+
+.remote-edit input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 3px 6px;
+  font-size: 12px;
+  font-family: Consolas, "Courier New", monospace;
+  outline: none;
+}
+
+.remote-edit input:focus {
+  border-color: var(--accent-2);
+}
+
 /* ---------- 提交列表 ---------- */
 
 .commit-list {

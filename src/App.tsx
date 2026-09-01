@@ -276,6 +276,8 @@ function App() {
   const [recentMenuIndex, setRecentMenuIndex] = useState(0); // 菜单里键盘高亮的那一项
   const pathMenuRef = useRef<HTMLDivElement>(null); // 包住显示框 + 菜单的容器
   const [leftTab, setLeftTab] = useState<"branches" | "files">("branches"); // 左栏顶部 tab：分支树 / 文件树
+  const [remoteUrlOpen, setRemoteUrlOpen] = useState(false); // 中栏过滤条上的「设置远程」输入行
+  const [remoteUrl, setRemoteUrl] = useState("");
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -506,6 +508,38 @@ function App() {
       setConsoleText(`> git ${op} 失败\n${String(e)}`);
     } finally {
       setOpBusy(null);
+    }
+  }
+
+  // ---------- 远程地址设置（git remote add / set-url origin） ----------
+
+  async function openRemoteSettings() {
+    if (remoteUrlOpen) {
+      setRemoteUrlOpen(false);
+      return;
+    }
+    try {
+      const u = await invoke<string | null>("get_remote_url", { name: null });
+      setRemoteUrl(u ?? "");
+      setRemoteUrlOpen(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function saveRemoteUrl() {
+    const url = remoteUrl.trim();
+    if (!url) {
+      setError("远程地址不能为空");
+      return;
+    }
+    try {
+      const msg = await invoke<string>("set_remote_url", { url, name: null });
+      setRemoteUrlOpen(false);
+      setConsoleText(`> git remote\n${msg}`);
+      setConsoleOpen(true);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -1018,8 +1052,36 @@ function App() {
                 >
                   {opBusy === "push" ? "…" : "↑ push"}
                 </button>
+                <button
+                  className="ghost small"
+                  onClick={openRemoteSettings}
+                  title="设置远程仓库地址（git remote add / set-url origin）"
+                >
+                  ⚙ 远程
+                </button>
               </div>
             </div>
+            {/* 「⚙ 远程」展开的设置行：输入远程仓库地址，回车或点保存生效 */}
+            {remoteUrlOpen && (
+              <div className="remote-edit">
+                <input
+                  autoFocus
+                  placeholder="https://github.com/user/repo.git 或 git@github.com:user/repo.git"
+                  value={remoteUrl}
+                  onChange={(e) => setRemoteUrl(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") saveRemoteUrl();
+                    if (e.key === "Escape") setRemoteUrlOpen(false);
+                  }}
+                />
+                <button className="ghost small" onClick={saveRemoteUrl} disabled={!remoteUrl.trim()}>
+                  保存
+                </button>
+                <button className="ghost small" onClick={() => setRemoteUrlOpen(false)}>
+                  取消
+                </button>
+              </div>
+            )}
             <div className="pane-body commit-list">
               {commits.map((c, i) => (
                 <div
