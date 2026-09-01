@@ -215,6 +215,17 @@ const STATUS_LABEL: Record<string, string> = {
   other: "?",
 };
 
+// ---------- 通用小工具 ----------
+
+function useDebounced<T>(value: T, ms: number): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setV(value), ms);
+    return () => clearTimeout(id);
+  }, [value, ms]);
+  return v;
+}
+
 // ---------- 主组件 ----------
 
 function App() {
@@ -230,13 +241,19 @@ function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
+  const [filterBranch, setFilterBranch] = useState(""); // "" = 全部（HEAD）
+  const [filterQuery, setFilterQuery] = useState("");
 
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
       const [bs, log, t, st] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
-        invoke<CommitInfo[]>("get_log", { limit: 200 }),
+        invoke<CommitInfo[]>("get_log", {
+          limit: 300,
+          branch: filterBranch || null,
+          query: filterQuery.trim() || null,
+        }),
         invoke<string[]>("get_head_tree"),
         invoke<StatusItem[]>("get_status"),
       ]);
@@ -247,7 +264,7 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, [repo]);
+  }, [repo, filterBranch, filterQuery]);
 
   async function openRepo(pathOverride?: string) {
     const path = (pathOverride ?? repoPath).trim();
@@ -283,9 +300,13 @@ function App() {
     if (path) await openRepo(path);
   }
 
+  // 过滤变更时 300ms 防抖：避免每个字符发一次 RPC
+  const debouncedQuery = useDebounced(filterQuery, 300);
+  const debouncedBranch = useDebounced(filterBranch, 300);
+
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, debouncedQuery, debouncedBranch]);
 
   // ---------- 分支 / 提交操作 ----------
 
@@ -469,6 +490,39 @@ function App() {
               </button>
             </div>
             <div className="pane-title">提交历史（{commits.length}）</div>
+            <div className="filter-toolbar">
+              <select
+                value={filterBranch}
+                onChange={(e) => setFilterBranch(e.currentTarget.value)}
+                title="按分支过滤"
+              >
+                <option value="">全部（HEAD）</option>
+                {localBranches.map((b) => (
+                  <option key={b.name} value={b.name}>⎇ {b.name}</option>
+                ))}
+                {remoteBranches.map((b) => (
+                  <option key={b.name} value={b.name}>☁ {b.name}</option>
+                ))}
+              </select>
+              <input
+                type="search"
+                placeholder="搜索 message / 作者 / hash…"
+                value={filterQuery}
+                onChange={(e) => setFilterQuery(e.currentTarget.value)}
+              />
+              {(filterBranch || filterQuery) && (
+                <button
+                  className="ghost small"
+                  title="清除过滤"
+                  onClick={() => {
+                    setFilterBranch("");
+                    setFilterQuery("");
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
             <div className="pane-body commit-list">
               {commits.map((c, i) => (
                 <div

@@ -169,7 +169,12 @@ fn list_branches(state: tauri::State<AppState>) -> Result<Vec<BranchInfo>, Strin
 }
 
 #[tauri::command]
-fn get_log(state: tauri::State<AppState>, limit: usize) -> Result<Vec<CommitInfo>, String> {
+fn get_log(
+    state: tauri::State<AppState>,
+    limit: usize,
+    branch: Option<String>,
+    query: Option<String>,
+) -> Result<Vec<CommitInfo>, String> {
     with_repo!(state, repo, {
         // 先建 ref 映射：oid -> [分支名/远程分支名]，用于在 log 行上打标签
         let mut refmap: HashMap<String, Vec<String>> = HashMap::new();
@@ -184,20 +189,50 @@ fn get_log(state: tauri::State<AppState>, limit: usize) -> Result<Vec<CommitInfo
         }
 
         let mut revwalk = repo.revwalk().map_err(to_err)?;
-        revwalk.push_head().map_err(to_err)?;
+        // 分支过滤：None / "HEAD" / "" 视为当前 HEAD；其余按 ref 名解析
+        match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("HEAD") => revwalk.push_head().map_err(to_err)?,
+            Some(name) => {
+                let obj = repo.revparse_single(name).map_err(to_err)?;
+                revwalk.push(obj.id()).map_err(to_err)?;
+            }
+        }
         revwalk
             .set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
             .map_err(to_err)?;
 
+        // 关键字过滤（小写匹配 oid / author / summary），过滤发生在 take(limit) 之前
+        // —— 这样返回的 limit 条都是匹配的；非匹配的可能需要遍历更多（最多 10k 条兜底）
+        let q_lower = query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase());
+
         let mut out = Vec::new();
-        for oid_res in revwalk.take(limit) {
+        let max_scan = 10_000usize; // 防止不匹配的 query 遍历整库
+        for oid_res in revwalk.take(max_scan) {
+            if out.len() >= limit {
+                break;
+            }
             let oid = oid_res.map_err(to_err)?;
             let commit = repo.find_commit(oid).map_err(to_err)?;
+            let summary = commit.summary().unwrap_or("").to_string();
+            let author = commit.author().name().unwrap_or("").to_string();
+
+            if let Some(q) = &q_lower {
+                let oid_str = oid.to_string();
+                let hay = format!("{} {} {}", oid_str, author, summary).to_lowercase();
+                if !hay.contains(q) {
+                    continue;
+                }
+            }
+
             out.push(CommitInfo {
                 oid: oid.to_string(),
                 short: oid.to_string().chars().take(7).collect(),
-                summary: commit.summary().unwrap_or("").to_string(),
-                author: commit.author().name().unwrap_or("").to_string(),
+                summary,
+                author,
                 email: commit.author().email().unwrap_or("").to_string(),
                 time: commit.time().seconds(),
                 parents: commit.parent_ids().map(|o| o.to_string()).collect(),
