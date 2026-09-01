@@ -109,6 +109,15 @@ function buildTree(paths: string[]): TreeNode[] {
       level = node.children;
     }
   }
+  // VS Code/IDEA 风格：目录在前、文件在后，同级按名称排序（不区分大小写）
+  const sortLevel = (nodes: TreeNode[]) => {
+    nodes.sort((a, b) => {
+      if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+    for (const n of nodes) sortLevel(n.children);
+  };
+  sortLevel(root);
   return root;
 }
 
