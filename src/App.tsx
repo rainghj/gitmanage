@@ -49,6 +49,12 @@ interface RecentEntry {
   lastOpened: number;
 }
 
+interface StashEntry {
+  index: number;
+  message: string;
+  oid: string;
+}
+
 // ---------- 文件树工具：平铺路径 → 嵌套树 ----------
 
 interface TreeNode {
@@ -261,6 +267,7 @@ function App() {
   const [filterBranch, setFilterBranch] = useState(""); // "" = 全部（HEAD）
   const [filterQuery, setFilterQuery] = useState("");
   const [recent, setRecent] = useState<RecentEntry[]>([]);
+  const [stashes, setStashes] = useState<StashEntry[]>([]);
   const [consoleText, setConsoleText] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [opBusy, setOpBusy] = useState<string | null>(null); // 当前正在执行的远程操作
@@ -268,7 +275,7 @@ function App() {
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st] = await Promise.all([
+      const [bs, log, t, st, s] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: 300,
@@ -277,11 +284,13 @@ function App() {
         }),
         invoke<string[]>("get_head_tree"),
         invoke<StatusItem[]>("get_status"),
+        invoke<StashEntry[]>("stash_list"),
       ]);
       setBranches(bs);
       setCommits(log);
       setTree(t);
       setStatus(st);
+      setStashes(s);
     } catch (e) {
       setError(String(e));
     }
@@ -405,6 +414,26 @@ function App() {
       setConsoleText(`> git ${op} 失败\n${String(e)}`);
     } finally {
       setOpBusy(null);
+    }
+  }
+
+  async function stashAll() {
+    try {
+      await invoke("stash_save", { message: null });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function stashOp(op: "pop" | "apply" | "drop", index: number) {
+    const verb = op === "drop" ? "删除" : op === "pop" ? "弹出并应用" : "应用";
+    if (!confirm(`确认${verb} stash@{${index}}？`)) return;
+    try {
+      await invoke(`stash_${op}`, { index });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -585,11 +614,58 @@ function App() {
                   onChange={(e) => setCommitMsg(e.currentTarget.value)}
                   rows={2}
                 />
-                <button onClick={doCommit} disabled={!commitMsg.trim()}>
-                  提交（自动暂存全部）
-                </button>
+                <div className="commit-actions">
+                  <button onClick={doCommit} disabled={!commitMsg.trim()}>
+                    提交（自动暂存全部）
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={stashAll}
+                    title="将当前所有改动压入 stash（含未跟踪）"
+                  >
+                    Stash 暂存
+                  </button>
+                </div>
               </div>
             )}
+
+            <div className="pane-title">Stash（{stashes.length}）</div>
+            <div className="pane-body stash-list">
+              {stashes.length === 0 && <div className="empty-hint">没有 stash</div>}
+              {stashes.map((s) => (
+                <div key={`${s.index}-${s.oid}`} className="stash-item">
+                  <div className="stash-meta">
+                    <span className="stash-index">stash@{s.index}</span>
+                    <span className="stash-msg" title={s.message}>
+                      {s.message}
+                    </span>
+                  </div>
+                  <div className="stash-actions">
+                    <button
+                      className="ghost xsmall"
+                      title="应用但不删除（apply）"
+                      onClick={() => stashOp("apply", s.index)}
+                    >
+                      apply
+                    </button>
+                    <button
+                      className="ghost xsmall"
+                      title="应用并删除（pop）"
+                      onClick={() => stashOp("pop", s.index)}
+                    >
+                      pop
+                    </button>
+                    <button
+                      className="ghost xsmall"
+                      title="直接删除（drop）"
+                      onClick={() => stashOp("drop", s.index)}
+                    >
+                      drop
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </aside>
 
           {/* 中栏：分支 + 提交历史 */}

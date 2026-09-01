@@ -113,11 +113,13 @@ fn to_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-/// 从 state 取仓库，处理锁 + None 两种情况，减少每个命令的样板代码
+/// 从 state 取仓库，处理锁 + None 两种情况，减少每个命令的样板代码。
+/// 一律用 as_mut() 拿到 &mut Repository——很多 git2 API（stash_*、checkout_tree 等）
+/// 需要可变借用，不可变 API 也接受可变借用（自动 reborrow），统一可变更省心。
 macro_rules! with_repo {
     ($state:expr, $repo:ident, $body:block) => {{
-        let guard = $state.repo.lock().map_err(to_err)?;
-        let $repo = guard.as_ref().ok_or("尚未打开仓库")?;
+        let mut guard = $state.repo.lock().map_err(to_err)?;
+        let $repo = guard.as_mut().ok_or("尚未打开仓库")?;
         $body
     }};
 }
@@ -458,6 +460,83 @@ fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Re
 
 // ---------- 暂存与提交 ----------
 
+// ---------- Stash（本地操作，直接用 git2 原生 API） ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StashEntry {
+    index: usize,
+    message: String,
+    oid: String,
+}
+
+/// 取提交签名；仓库没配 user.name/email 时兜底，避免 stash 直接失败
+fn signature_or_default(repo: &Repository) -> Result<git2::Signature<'static>, String> {
+    match repo.signature() {
+        Ok(s) => Ok(git2::Signature::new(
+            s.name().unwrap_or("unknown"),
+            s.email().unwrap_or("unknown@local"),
+            &s.when(),
+        )
+        .map_err(to_err)?),
+        Err(_) => git2::Signature::now("GitManage", "gitmanage@local").map_err(to_err),
+    }
+}
+
+#[tauri::command]
+fn stash_list(state: tauri::State<AppState>) -> Result<Vec<StashEntry>, String> {
+    with_repo!(state, repo, {
+        let mut out = Vec::new();
+        repo.stash_foreach(|index, message, oid| {
+            out.push(StashEntry {
+                index,
+                message: message.to_string(),
+                oid: oid.to_string(),
+            });
+            true // 继续遍历
+        })
+        .map_err(to_err)?;
+        Ok(out)
+    })
+}
+
+#[tauri::command]
+fn stash_save(state: tauri::State<AppState>, message: Option<String>) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let sig = signature_or_default(repo)?;
+        let msg = message
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "GitManage 自动暂存".to_string());
+        let oid = repo
+            .stash_save(&sig, &msg, Some(git2::StashFlags::INCLUDE_UNTRACKED))
+            .map_err(to_err)?;
+        Ok(oid.to_string())
+    })
+}
+
+/// pop = apply + drop，索引不存在时 git2 会返回错误
+#[tauri::command]
+fn stash_pop(state: tauri::State<AppState>, index: usize) -> Result<(), String> {
+    with_repo!(state, repo, {
+        repo.stash_pop(index, None).map_err(to_err)
+    })
+}
+
+#[tauri::command]
+fn stash_apply(state: tauri::State<AppState>, index: usize) -> Result<(), String> {
+    with_repo!(state, repo, {
+        repo.stash_apply(index, None).map_err(to_err)
+    })
+}
+
+#[tauri::command]
+fn stash_drop(state: tauri::State<AppState>, index: usize) -> Result<(), String> {
+    with_repo!(state, repo, {
+        repo.stash_drop(index).map_err(to_err)
+    })
+}
+
 // ---------- 远程操作（git CLI 侧车） ----------
 //
 // git2 编译时关掉了 https/ssh（default-features=false），网络操作交给系统 git 命令：
@@ -620,6 +699,11 @@ pub fn run() {
             add_recent,
             remove_recent,
             git_remote_op,
+            stash_list,
+            stash_save,
+            stash_pop,
+            stash_apply,
+            stash_drop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

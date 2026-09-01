@@ -436,6 +436,63 @@ button.link {
   border-color: var(--accent-2);
 }
 
+.commit-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.commit-actions button {
+  flex: 1;
+  font-size: 12px;
+}
+
+/* ---------- Stash 列表 ---------- */
+
+.stash-item {
+  padding: 4px 10px;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.stash-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.stash-index {
+  font-family: Consolas, "Courier New", monospace;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.stash-msg {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.stash-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+button.ghost.xsmall {
+  padding: 1px 6px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+button.ghost.xsmall:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ---------- 过滤工具栏 ---------- */
 
 .filter-toolbar {
