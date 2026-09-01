@@ -137,6 +137,7 @@ function App() {
   const [diff, setDiff] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [commitMsg, setCommitMsg] = useState("");
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -179,6 +180,51 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // ---------- 分支 / 提交操作 ----------
+
+  async function checkoutBranch(name: string) {
+    if (!confirm(`切换到分支 ${name}？`)) return;
+    try {
+      await invoke("checkout_branch", { name });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function createBranch() {
+    const name = window.prompt("新分支名（基于当前 HEAD 创建并切换）：");
+    if (!name?.trim()) return;
+    try {
+      await invoke("create_branch", { name: name.trim(), checkout: true });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function deleteBranch(name: string) {
+    if (!confirm(`删除分支 ${name}？未合并的分支会被拒绝。`)) return;
+    try {
+      await invoke("delete_branch", { name, force: false });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function doCommit() {
+    if (!commitMsg.trim()) return;
+    try {
+      await invoke("stage_all");
+      await invoke("commit", { message: commitMsg });
+      setCommitMsg("");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   useEffect(() => {
     if (!selected) return;
@@ -263,14 +309,44 @@ function App() {
                 </div>
               ))}
             </div>
+            {status.length > 0 && (
+              <div className="commit-box">
+                <textarea
+                  placeholder="提交信息…"
+                  value={commitMsg}
+                  onChange={(e) => setCommitMsg(e.currentTarget.value)}
+                  rows={2}
+                />
+                <button onClick={doCommit} disabled={!commitMsg.trim()}>
+                  提交（自动暂存全部）
+                </button>
+              </div>
+            )}
           </aside>
 
           {/* 中栏：分支 + 提交历史 */}
           <section className="pane center">
             <div className="branch-row">
               {localBranches.map((b) => (
-                <span key={b.name} className={`branch-chip local ${b.isHead ? "current" : ""}`}>
+                <span
+                  key={b.name}
+                  className={`branch-chip local ${b.isHead ? "current" : "clickable"}`}
+                  title={b.isHead ? "当前分支" : `点击切换到 ${b.name}`}
+                  onClick={() => !b.isHead && checkoutBranch(b.name)}
+                >
                   ⎇ {b.name}
+                  {!b.isHead && (
+                    <button
+                      className="chip-x"
+                      title="删除分支"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteBranch(b.name);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
                 </span>
               ))}
               {remoteBranches.map((b) => (
@@ -278,6 +354,9 @@ function App() {
                   ☁ {b.name}
                 </span>
               ))}
+              <button className="chip-add" title="基于 HEAD 新建分支并切换" onClick={createBranch}>
+                ＋ 新分支
+              </button>
             </div>
             <div className="pane-title">提交历史（{commits.length}）</div>
             <div className="pane-body commit-list">

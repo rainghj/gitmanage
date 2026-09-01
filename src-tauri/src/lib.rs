@@ -317,6 +317,97 @@ fn get_status(state: tauri::State<AppState>) -> Result<Vec<StatusItem>, String> 
     })
 }
 
+// ---------- 分支操作 ----------
+
+#[tauri::command]
+fn checkout_branch(state: tauri::State<AppState>, name: String) -> Result<(), String> {
+    with_repo!(state, repo, {
+        let (obj, reference) = repo.revparse_ext(&name).map_err(to_err)?;
+        repo.checkout_tree(&obj, None).map_err(to_err)?;
+        match reference {
+            Some(r) => repo
+                .set_head(r.name().ok_or("invalid ref name")?)
+                .map_err(to_err),
+            None => repo.set_head_detached(obj.id()).map_err(to_err),
+        }
+    })
+}
+
+#[tauri::command]
+fn create_branch(
+    state: tauri::State<AppState>,
+    name: String,
+    checkout: bool,
+) -> Result<(), String> {
+    with_repo!(state, repo, {
+        let head = repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?;
+        repo.branch(&name, &head, false).map_err(to_err)?;
+        if checkout {
+            let obj = repo.revparse_single(&format!("refs/heads/{name}")).map_err(to_err)?;
+            repo.checkout_tree(&obj, None).map_err(to_err)?;
+            repo.set_head(&format!("refs/heads/{name}")).map_err(to_err)?;
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Result<(), String> {
+    with_repo!(state, repo, {
+        let mut branch = repo.find_branch(&name, BranchType::Local).map_err(to_err)?;
+        if branch.is_head() {
+            return Err("不能删除当前分支".to_string());
+        }
+        // 用 graph_descendant_of 判断分支 tip 是否已合并进 HEAD
+        let tip = branch.get().target().ok_or("分支没有目标提交")?;
+        let head_oid = repo.head().map_err(to_err)?.target().ok_or("HEAD 没有目标提交")?;
+        let merged = tip == head_oid || repo.graph_descendant_of(head_oid, tip).map_err(to_err)?;
+        if !force && !merged {
+            return Err("分支未合并，需要 force 才能删除".to_string());
+        }
+        branch.delete().map_err(to_err)
+    })
+}
+
+// ---------- 暂存与提交 ----------
+
+#[tauri::command]
+fn stage_all(state: tauri::State<AppState>) -> Result<usize, String> {
+    with_repo!(state, repo, {
+        let mut index = repo.index().map_err(to_err)?;
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .map_err(to_err)?;
+        index.write().map_err(to_err)?;
+        Ok(index.len())
+    })
+}
+
+#[tauri::command]
+fn commit(state: tauri::State<AppState>, message: String) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("提交信息不能为空".to_string());
+    }
+    with_repo!(state, repo, {
+        let sig = repo.signature().map_err(to_err)?;
+        let mut index = repo.index().map_err(to_err)?;
+        let tree_oid = index.write_tree().map_err(to_err)?;
+        let tree = repo.find_tree(tree_oid).map_err(to_err)?;
+
+        // 有 HEAD 则以 HEAD 为父提交，否则为根提交
+        let parents = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            Some(c) => vec![c],
+            None => vec![],
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, &message, &tree, &parent_refs)
+            .map_err(to_err)?;
+        Ok(oid.to_string())
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -332,6 +423,11 @@ pub fn run() {
             get_diff,
             get_head_tree,
             get_status,
+            checkout_branch,
+            create_branch,
+            delete_branch,
+            stage_all,
+            commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

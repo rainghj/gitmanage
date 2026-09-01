@@ -260,6 +260,69 @@ button.link {
   color: var(--text-dim);
 }
 
+.branch-chip.clickable {
+  cursor: pointer;
+}
+
+.branch-chip.clickable:hover {
+  background: var(--panel-2);
+}
+
+.chip-x {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 0 0 0 6px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chip-x:hover {
+  color: var(--red);
+}
+
+.chip-add {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  border-radius: 10px;
+  padding: 1px 10px;
+  font-size: 12px;
+}
+
+.chip-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------- 提交框 ---------- */
+
+.commit-box {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.commit-box textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+  outline: none;
+}
+
+.commit-box textarea:focus {
+  border-color: var(--accent-2);
+}
+
 /* ---------- 提交列表 ---------- */
 
 .commit-list {
