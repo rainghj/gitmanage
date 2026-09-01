@@ -445,46 +445,93 @@ button.link {
 .st-renamed { color: var(--accent); }
 .st-other { color: var(--text-dim); }
 
-/* ---------- 分支行 ---------- */
+/* ---------- 左栏 tab（分支树 / 文件树） ---------- */
 
-.branch-row {
+.left-tabs {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 10px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
 
-.branch-chip {
-  border-radius: 10px;
-  padding: 1px 10px;
+.left-tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text-dim);
+  padding: 6px 0;
   font-size: 12px;
-  white-space: nowrap;
+  text-align: center;
 }
 
-.branch-chip.local {
-  border: 1px solid var(--accent);
+.left-tab:hover {
+  color: var(--text);
+  filter: none;
+}
+
+.left-tab.active {
   color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
-.branch-chip.local.current {
-  background: var(--accent);
-  color: #1e1e1e;
-  font-weight: 600;
-}
+/* ---------- 分支树（IDEA 风格，本地/远程分组） ---------- */
 
-.branch-chip.remote {
-  border: 1px solid var(--border);
+.branch-tree-group {
+  padding: 6px 10px 3px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
   color: var(--text-dim);
 }
 
-.branch-chip.clickable {
+.branch-tree-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 10px 3px 18px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.branch-tree-item.clickable {
   cursor: pointer;
 }
 
-.branch-chip.clickable:hover {
+.branch-tree-item.clickable:hover {
   background: var(--panel-2);
+}
+
+.branch-tree-item.current {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.branch-tree-item.remote {
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.branch-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.branch-tree-add {
+  margin: 6px 10px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.branch-tree-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .chip-x {
@@ -495,24 +542,11 @@ button.link {
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .chip-x:hover {
   color: var(--red);
-}
-
-.chip-add {
-  background: transparent;
-  border: 1px dashed var(--border);
-  color: var(--text-dim);
-  border-radius: 10px;
-  padding: 1px 10px;
-  font-size: 12px;
-}
-
-.chip-add:hover {
-  border-color: var(--accent);
-  color: var(--accent);
 }
 
 /* ---------- 提交框 ---------- */
@@ -640,6 +674,14 @@ button.ghost.small {
   font-size: 11px;
 }
 
+/* 过滤条右侧的远程操作组（fetch/pull/push） */
+.filter-remote {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
 /* ---------- 提交列表 ---------- */
 
 .commit-list {
@@ -649,7 +691,7 @@ button.ghost.small {
 .commit-item {
   padding: 0 10px;
   /* 高度需与 App.tsx 里 GRAPH_ROW_H 保持一致，分支图 SVG 才能接得上 */
-  height: 46px;
+  height: 28px;
   border-bottom: 1px solid #2a2a2a;
   cursor: pointer;
 }
@@ -658,17 +700,11 @@ button.ghost.small {
   display: flex;
   align-items: center;
   height: 100%;
+  gap: 6px;
 }
 
 .commit-graph {
   flex-shrink: 0;
-  margin-right: 6px;
-}
-
-.commit-content {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
 }
 
 .commit-item:hover {
@@ -680,6 +716,8 @@ button.ghost.small {
 }
 
 .commit-summary {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -716,10 +754,15 @@ button.ghost.small {
   white-space: nowrap;
 }
 
+/* 单行提交行右侧：作者·时间，不收缩不折行 */
 .commit-meta {
-  margin-top: 2px;
+  flex-shrink: 0;
+  margin-left: 10px;
+  display: flex;
+  align-items: center;
   color: var(--text-dim);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .merge-tag {
@@ -733,9 +776,38 @@ button.ghost.small {
 
 /* ---------- 右栏 ---------- */
 
+/* 提交详情头（IDEA 风格：选中提交的完整信息常驻顶部） */
+.commit-detail-head {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-summary {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.detail-meta {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.detail-hash {
+  font-size: 11px;
+}
+
 .right .change-list {
   flex: 0 0 auto;
-  max-height: 35%;
+  max-height: 30%;
   border-bottom: 1px solid var(--border);
 }
 

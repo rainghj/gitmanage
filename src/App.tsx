@@ -119,7 +119,7 @@ interface GraphRow {
 }
 
 const GRAPH_LANE_W = 14; // 每条泳道宽度
-const GRAPH_ROW_H = 46; // 行高，需与 CSS .commit-item 的高度一致
+const GRAPH_ROW_H = 28; // 行高，需与 CSS .commit-item 的高度一致
 const LANE_COLORS = ["#569cd6", "#4ec9b0", "#d7ba7d", "#ce9178", "#b5cea8", "#9cdcfe"];
 
 function computeGraph(commits: CommitInfo[]): { rows: GraphRow[]; laneCount: number } {
@@ -275,6 +275,7 @@ function App() {
   const [pathMenuOpen, setPathMenuOpen] = useState(false); // 路径显示框（已开仓库时）点击弹出的统一菜单
   const [recentMenuIndex, setRecentMenuIndex] = useState(0); // 菜单里键盘高亮的那一项
   const pathMenuRef = useRef<HTMLDivElement>(null); // 包住显示框 + 菜单的容器
+  const [leftTab, setLeftTab] = useState<"branches" | "files">("branches"); // 左栏顶部 tab：分支树 / 文件树
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -548,6 +549,17 @@ function App() {
   const localBranches = branches.filter((b) => !b.isRemote);
   const remoteBranches = branches.filter((b) => b.isRemote);
   const current = branches.find((b) => b.isHead);
+  // 右栏提交详情头的数据源：选中提交在当前过滤结果里才找得到
+  const selectedCommit = selected ? commits.find((c) => c.oid === selected) ?? null : null;
+  // 提交列表行内的时间用短格式（IDEA 风格：M/D HH:mm），详情头里再用完整格式
+  const fmtShort = (t: number) =>
+    new Date(t * 1000).toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
 
   return (
     <div className="app">
@@ -688,31 +700,8 @@ function App() {
           </span>
         )}
         {repo && (
+          // fetch/pull/push 已移到中栏过滤条右侧——它们是针对提交历史的操作，顶栏只留仓库级操作
           <div className="remote-actions">
-            <button
-              className="ghost small"
-              onClick={() => doRemoteOp("fetch")}
-              disabled={opBusy !== null}
-              title="git fetch"
-            >
-              {opBusy === "fetch" ? "…" : "↓ fetch"}
-            </button>
-            <button
-              className="ghost small"
-              onClick={() => doRemoteOp("pull")}
-              disabled={opBusy !== null}
-              title="git pull（当前分支）"
-            >
-              {opBusy === "pull" ? "…" : "↓ pull"}
-            </button>
-            <button
-              className="ghost small"
-              onClick={() => doRemoteOp("push")}
-              disabled={opBusy !== null}
-              title="git push（当前分支）"
-            >
-              {opBusy === "push" ? "…" : "↑ push"}
-            </button>
             <button
               className="ghost small"
               onClick={() => setConsoleOpen((o) => !o)}
@@ -828,12 +817,70 @@ function App() {
         <div className="main">
           {/* 左栏：文件树 + 工作区状态 */}
           <aside className="pane left">
-            <div className="pane-title">项目 · {repo.name}</div>
+            {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 */}
+            <div className="left-tabs">
+              <button
+                className={`left-tab ${leftTab === "branches" ? "active" : ""}`}
+                onClick={() => setLeftTab("branches")}
+              >
+                分支
+              </button>
+              <button
+                className={`left-tab ${leftTab === "files" ? "active" : ""}`}
+                onClick={() => setLeftTab("files")}
+                title={`项目文件树 · ${repo.name}`}
+              >
+                文件树
+              </button>
+            </div>
             <div className="pane-body">
-              {repo.isEmpty ? (
-                <div className="empty-hint">空仓库（尚无提交）</div>
+              {leftTab === "files" ? (
+                repo.isEmpty ? (
+                  <div className="empty-hint">空仓库（尚无提交）</div>
+                ) : (
+                  <FileTreeView nodes={buildTree(tree)} />
+                )
               ) : (
-                <FileTreeView nodes={buildTree(tree)} />
+                <div className="branch-tree">
+                  <div className="branch-tree-group">本地</div>
+                  {localBranches.map((b) => (
+                    <div
+                      key={b.name}
+                      className={`branch-tree-item ${b.isHead ? "current" : "clickable"}`}
+                      title={b.isHead ? "当前分支" : `点击切换到 ${b.name}`}
+                      onClick={() => !b.isHead && checkoutBranch(b.name)}
+                    >
+                      <span className="branch-tree-name">⎇ {b.name}</span>
+                      {!b.isHead && (
+                        <button
+                          className="chip-x"
+                          title="删除分支"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteBranch(b.name);
+                          }}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {remoteBranches.length > 0 && (
+                    <div className="branch-tree-group">远程</div>
+                  )}
+                  {remoteBranches.map((b) => (
+                    <div key={b.name} className="branch-tree-item remote">
+                      <span className="branch-tree-name">☁ {b.name}</span>
+                    </div>
+                  ))}
+                  <button
+                    className="branch-tree-add"
+                    title="基于 HEAD 新建分支并切换"
+                    onClick={createBranch}
+                  >
+                    ＋ 新分支
+                  </button>
+                </div>
               )}
             </div>
             <div className="pane-title">更改（{status.length}）</div>
@@ -910,40 +957,8 @@ function App() {
             </div>
           </aside>
 
-          {/* 中栏：分支 + 提交历史 */}
+          {/* 中栏：提交历史（分支管理已挪到左栏分支树） */}
           <section className="pane center">
-            <div className="branch-row">
-              {localBranches.map((b) => (
-                <span
-                  key={b.name}
-                  className={`branch-chip local ${b.isHead ? "current" : "clickable"}`}
-                  title={b.isHead ? "当前分支" : `点击切换到 ${b.name}`}
-                  onClick={() => !b.isHead && checkoutBranch(b.name)}
-                >
-                  ⎇ {b.name}
-                  {!b.isHead && (
-                    <button
-                      className="chip-x"
-                      title="删除分支"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteBranch(b.name);
-                      }}
-                    >
-                      ×
-                    </button>
-                  )}
-                </span>
-              ))}
-              {remoteBranches.map((b) => (
-                <span key={b.name} className="branch-chip remote">
-                  ☁ {b.name}
-                </span>
-              ))}
-              <button className="chip-add" title="基于 HEAD 新建分支并切换" onClick={createBranch}>
-                ＋ 新分支
-              </button>
-            </div>
             <div className="pane-title">提交历史（{commits.length}）</div>
             <div className="filter-toolbar">
               <select
@@ -977,6 +992,33 @@ function App() {
                   清除
                 </button>
               )}
+              {/* 远程操作放在提交历史的工具条上（IDEA 风格），顶栏只留仓库级操作 */}
+              <div className="filter-remote">
+                <button
+                  className="ghost small"
+                  onClick={() => doRemoteOp("fetch")}
+                  disabled={opBusy !== null}
+                  title="git fetch"
+                >
+                  {opBusy === "fetch" ? "…" : "↓ fetch"}
+                </button>
+                <button
+                  className="ghost small"
+                  onClick={() => doRemoteOp("pull")}
+                  disabled={opBusy !== null}
+                  title="git pull（当前分支）"
+                >
+                  {opBusy === "pull" ? "…" : "↓ pull"}
+                </button>
+                <button
+                  className="ghost small"
+                  onClick={() => doRemoteOp("push")}
+                  disabled={opBusy !== null}
+                  title="git push（当前分支）"
+                >
+                  {opBusy === "push" ? "…" : "↑ push"}
+                </button>
+              </div>
             </div>
             <div className="pane-body commit-list">
               {commits.map((c, i) => (
@@ -991,22 +1033,21 @@ function App() {
                       laneCount={laneCount}
                       isLast={i === commits.length - 1}
                     />
-                    <div className="commit-content">
-                      <div className="commit-summary">
-                        <span className="hash">{c.short}</span>
-                        {c.refs.map((r) => (
-                          <span key={r} className={`ref-chip ${r.includes("/") ? "remote" : "local"}`}>
-                            {r}
-                          </span>
-                        ))}
-                        <span className="summary-text" title={c.summary}>
-                          {c.summary}
+                    {/* 单行布局（IDEA 风格）：hash + refs + message 省略号，作者·时间右对齐 */}
+                    <div className="commit-summary">
+                      <span className="hash">{c.short}</span>
+                      {c.refs.map((r) => (
+                        <span key={r} className={`ref-chip ${r.includes("/") ? "remote" : "local"}`}>
+                          {r}
                         </span>
-                      </div>
-                      <div className="commit-meta">
-                        {c.author} · {new Date(c.time * 1000).toLocaleString("zh-CN")}
-                        {c.parents.length > 1 && <span className="merge-tag">merge</span>}
-                      </div>
+                      ))}
+                      <span className="summary-text" title={c.summary}>
+                        {c.summary}
+                      </span>
+                    </div>
+                    <div className="commit-meta">
+                      {c.parents.length > 1 && <span className="merge-tag">merge</span>}
+                      {c.author} · {fmtShort(c.time)}
                     </div>
                   </div>
                 </div>
@@ -1014,8 +1055,24 @@ function App() {
             </div>
           </section>
 
-          {/* 右栏：文件变更 + diff */}
+          {/* 右栏：提交详情头 + 文件变更 + diff */}
           <section className="pane right">
+            {selectedCommit ? (
+              <div className="commit-detail-head">
+                <div className="detail-summary" title={selectedCommit.summary}>
+                  {selectedCommit.summary}
+                </div>
+                <div className="detail-meta">
+                  {selectedCommit.author} ·{" "}
+                  {new Date(selectedCommit.time * 1000).toLocaleString("zh-CN", { hour12: false })}
+                  <span className="hash detail-hash" title="完整 hash">
+                    {selectedCommit.oid}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="commit-detail-head empty-hint">选择左侧提交查看详情</div>
+            )}
             <div className="pane-title">
               改动文件（{files.length}）
             </div>
