@@ -629,6 +629,68 @@ fn stash_drop(state: tauri::State<AppState>, index: usize) -> Result<(), String>
     })
 }
 
+// ---------- 「不提交」列表（本地修改但不提交的文件） ----------
+//
+// 持久化在 .git/info/gitmanage-skip.json——.git/info/ 本就是 git 放仓库级本地配置的地方
+// （info/exclude 同理），不进版本库、不随 push 传播，语义正好是"只在本机生效"。
+
+fn skip_file(repo: &Repository) -> std::path::PathBuf {
+    repo.path().join("info/gitmanage-skip.json")
+}
+
+fn read_skip(repo: &Repository) -> Vec<String> {
+    std::fs::read_to_string(skip_file(repo))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_skip_list(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    with_repo!(state, repo, { Ok(read_skip(repo)) })
+}
+
+/// 把路径加入/移出「不提交」列表，返回更新后的完整列表
+#[tauri::command]
+fn set_skip(state: tauri::State<AppState>, path: String, skip: bool) -> Result<Vec<String>, String> {
+    with_repo!(state, repo, {
+        let mut list = read_skip(repo);
+        if skip {
+            if !list.contains(&path) {
+                list.push(path);
+            }
+        } else {
+            list.retain(|p| *p != path);
+        }
+        let f = skip_file(repo);
+        if let Some(dir) = f.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("无法创建 info 目录: {e}"))?;
+        }
+        let json = serde_json::to_string_pretty(&list).map_err(to_err)?;
+        std::fs::write(&f, json).map_err(|e| format!("写入不提交列表失败: {e}"))?;
+        Ok(list)
+    })
+}
+
+/// 只暂存指定路径（文件级勾选提交用）。已删除的文件走 remove_path 从索引移除。
+#[tauri::command]
+fn stage_files(state: tauri::State<AppState>, paths: Vec<String>) -> Result<usize, String> {
+    with_repo!(state, repo, {
+        let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        let mut index = repo.index().map_err(to_err)?;
+        for p in &paths {
+            let rel = std::path::Path::new(p);
+            if workdir.join(rel).exists() {
+                index.add_path(rel).map_err(to_err)?;
+            } else {
+                index.remove_path(rel).map_err(to_err)?;
+            }
+        }
+        index.write().map_err(to_err)?;
+        Ok(paths.len())
+    })
+}
+
 // ---------- 远程操作（git CLI 侧车） ----------
 //
 // git2 编译时关掉了 https/ssh（default-features=false），网络操作交给系统 git 命令：
@@ -890,6 +952,9 @@ pub fn run() {
             create_branch,
             delete_branch,
             stage_all,
+            stage_files,
+            get_skip_list,
+            set_skip,
             commit,
             get_recent,
             add_recent,

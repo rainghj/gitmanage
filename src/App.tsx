@@ -347,11 +347,17 @@ function App() {
   const [tabData, setTabData] = useState<Record<string, string>>({});
   // 文件标签的未保存草稿（key = tabKey）；与 tabData 分离，refresh 清缓存时草稿不丢
   const [tabDrafts, setTabDrafts] = useState<Record<string, string>>({});
+  // 「不提交」列表（持久化在 .git/info/gitmanage-skip.json，后端读写）
+  const [skipList, setSkipList] = useState<string[]>([]);
+  // 更改列表里被取消勾选的文件（默认全部勾选，提交只提交勾选项）
+  const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
+  // 更改/不提交列表项的右键菜单
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; inSkip: boolean } | null>(null);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st, s, ab] = await Promise.all([
+      const [bs, log, t, st, s, ab, sk] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: 300,
@@ -362,6 +368,7 @@ function App() {
         invoke<StatusItem[]>("get_status"),
         invoke<StashEntry[]>("stash_list"),
         invoke<[number, number] | null>("get_ahead_behind"),
+        invoke<string[]>("get_skip_list"),
       ]);
       setBranches(bs);
       setCommits(log);
@@ -369,6 +376,7 @@ function App() {
       setStatus(st);
       setStashes(s);
       setSyncCounts(ab);
+      setSkipList(sk);
       // 已打开的文件/对比标签内容可能已过时，清空缓存让激活标签重拉
       setTabData({});
     } catch (e) {
@@ -477,6 +485,8 @@ function App() {
       setTabs([{ kind: "history" }]);
       setActiveTab(0);
       setTabData({});
+      setUnchecked(new Set());
+      setCtxMenu(null);
       // 异步记一条最近打开，失败不阻塞主流程；成功后刷新最近列表，更新菜单和欢迎页
       invoke("add_recent", { path: summary.path })
         .then(loadRecent)
@@ -640,11 +650,39 @@ function App() {
 
   async function doCommit() {
     if (!commitMsg.trim()) return;
+    // 只暂存勾选且不在「不提交」列表里的文件
+    const paths = status
+      .filter((s) => !skipList.includes(s.path) && !unchecked.has(s.path))
+      .map((s) => s.path);
+    if (paths.length === 0) {
+      setError("没有勾选要提交的文件");
+      return;
+    }
     try {
-      await invoke("stage_all");
+      await invoke("stage_files", { paths });
       await invoke("commit", { message: commitMsg });
       setCommitMsg("");
+      setUnchecked(new Set());
       await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // 更改 ⇄ 不提交 双向移动（右键菜单触发），列表持久化在后端
+  async function toggleSkip(path: string, toSkip: boolean) {
+    try {
+      const list = await invoke<string[]>("set_skip", { path, skip: toSkip });
+      setSkipList(list);
+      if (toSkip) {
+        // 移入不提交时清掉勾选残留
+        setUnchecked((u) => {
+          const n = new Set(u);
+          n.delete(path);
+          return n;
+        });
+      }
+      setCtxMenu(null);
     } catch (e) {
       setError(String(e));
     }
@@ -747,6 +785,10 @@ function App() {
   const localBranches = branches.filter((b) => !b.isRemote);
   const remoteBranches = branches.filter((b) => b.isRemote);
   const current = branches.find((b) => b.isHead);
+  // 更改列表拆成两部分：不提交列表里的文件单独成区，不参与勾选提交
+  const visibleStatus = status.filter((s) => !skipList.includes(s.path));
+  const skippedStatus = status.filter((s) => skipList.includes(s.path));
+  const checkedCount = visibleStatus.filter((s) => !unchecked.has(s.path)).length;
   // 右栏提交详情头的数据源：选中提交在当前过滤结果里才找得到
   const selectedCommit = selected ? commits.find((c) => c.oid === selected) ?? null : null;
   // 提交列表行内的时间用短格式（IDEA 风格：M/D HH:mm），详情头里再用完整格式
@@ -1085,16 +1127,36 @@ function App() {
                 </div>
               )}
             </div>
-            <div className="pane-title">更改（{status.length}）</div>
+            <div className="pane-title">更改（{visibleStatus.length}）</div>
             <div className="pane-body status-list">
-              {status.length === 0 && <div className="empty-hint">工作区干净</div>}
-              {status.map((s) => (
+              {visibleStatus.length === 0 && <div className="empty-hint">工作区干净</div>}
+              {visibleStatus.map((s) => (
                 <div
                   key={s.path}
                   className="status-item clickable"
-                  title={`${s.path}（点击在中栏查看对比）`}
+                  title={`${s.path}（点击查看对比，右键移到「不提交」）`}
                   onClick={() => openCenterTab("wdiff", s.path)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setCtxMenu({ x: e.clientX, y: e.clientY, path: s.path, inSkip: false });
+                  }}
                 >
+                  <input
+                    type="checkbox"
+                    className="status-check"
+                    checked={!unchecked.has(s.path)}
+                    title="勾选参与本次提交"
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const on = e.currentTarget.checked;
+                      setUnchecked((u) => {
+                        const n = new Set(u);
+                        if (on) n.delete(s.path);
+                        else n.add(s.path);
+                        return n;
+                      });
+                    }}
+                  />
                   <span className={`status-badge st-${s.status}`}>
                     {STATUS_LABEL[s.status] ?? "?"}
                   </span>
@@ -1102,7 +1164,7 @@ function App() {
                 </div>
               ))}
             </div>
-            {status.length > 0 && (
+            {visibleStatus.length > 0 && (
               <div className="commit-box">
                 <textarea
                   placeholder="提交信息…"
@@ -1111,8 +1173,8 @@ function App() {
                   rows={2}
                 />
                 <div className="commit-actions">
-                  <button onClick={doCommit} disabled={!commitMsg.trim()}>
-                    提交（自动暂存全部）
+                  <button onClick={doCommit} disabled={!commitMsg.trim() || checkedCount === 0}>
+                    提交（{checkedCount} 个文件）
                   </button>
                   <button
                     className="ghost"
@@ -1123,6 +1185,32 @@ function App() {
                   </button>
                 </div>
               </div>
+            )}
+
+            {/* 「不提交」：本地修改但不想提交的文件，右键可移回更改；列表存在 .git/info 里 */}
+            {skippedStatus.length > 0 && (
+              <>
+                <div className="pane-title">不提交（{skippedStatus.length}）</div>
+                <div className="pane-body status-list skip-list">
+                  {skippedStatus.map((s) => (
+                    <div
+                      key={s.path}
+                      className="status-item clickable skipped"
+                      title={`${s.path}（点击查看对比，右键移回「更改」）`}
+                      onClick={() => openCenterTab("wdiff", s.path)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setCtxMenu({ x: e.clientX, y: e.clientY, path: s.path, inSkip: true });
+                      }}
+                    >
+                      <span className={`status-badge st-${s.status}`}>
+                        {STATUS_LABEL[s.status] ?? "?"}
+                      </span>
+                      {s.path}
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
 
             <div className="pane-title">Stash（{stashes.length}）</div>
@@ -1415,6 +1503,40 @@ function App() {
             </div>
           </section>
           )}
+        </div>
+      )}
+
+      {/* 更改/不提交列表项的右键菜单：透明遮罩点击即关 */}
+      {ctxMenu && (
+        <div
+          className="ctx-overlay"
+          onClick={() => setCtxMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setCtxMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {ctxMenu.inSkip ? (
+              <button
+                className="recent-menu-item"
+                onClick={() => toggleSkip(ctxMenu.path, false)}
+              >
+                ↩ 移回「更改」
+              </button>
+            ) : (
+              <button
+                className="recent-menu-item"
+                onClick={() => toggleSkip(ctxMenu.path, true)}
+              >
+                ⏏ 移到「不提交」（本地保留改动，不参与提交）
+              </button>
+            )}
+          </div>
         </div>
       )}
 

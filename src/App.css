@@ -856,6 +856,39 @@ button.ghost.small {
   cursor: pointer;
 }
 
+/* 更改条目的提交勾选框 */
+.status-check {
+  flex-shrink: 0;
+  accent-color: var(--accent-2);
+  cursor: pointer;
+}
+
+/* 「不提交」分区：整体降灰，表示不参与提交 */
+.skip-list .status-item {
+  opacity: 0.55;
+}
+
+.skip-list .status-item:hover {
+  opacity: 0.85;
+}
+
+/* 右键菜单 */
+.ctx-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+}
+
+.ctx-menu {
+  position: fixed;
+  min-width: 220px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
 /* ---------- 提交列表 ---------- */
 
 .commit-list {
