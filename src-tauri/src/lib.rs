@@ -663,6 +663,9 @@ fn remove_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 fn reveal_in_explorer(path: String) -> Result<(), String> {
     use std::path::Path;
+    // explorer.exe 把 "/" 视为开关前缀（/select 等），正斜杠路径会被当成无效参数，
+    // 静默退化为打开默认文件夹（文档）——必须先把分隔符统一成反斜杠。
+    let path = path.replace('/', "\\");
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {path}"));
