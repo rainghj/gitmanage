@@ -344,31 +344,90 @@ fn get_commit_files(state: tauri::State<AppState>, oid: String) -> Result<Vec<Fi
     })
 }
 
+/// 把 git2 Diff 打印成统一文本：文件头转成 === path === 分隔行，增删行带 +/- 前缀，
+/// 前端 DiffView 按前缀上色。get_diff / get_workdir_diff 共用。
+fn patch_to_string(diff: git2::Diff) -> Result<String, String> {
+    let mut buf = String::new();
+    diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        match line.origin() {
+            // 增删/上下文行：带前缀输出
+            '+' | '-' | ' ' => {
+                buf.push(line.origin());
+                buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+            }
+            // 文件头：转成我们自己的分隔行，前端好按文件分段渲染
+            'F' => {
+                if let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy()) {
+                    buf.push_str(&format!("\n=== {path} ===\n"));
+                }
+            }
+            // 其余（hunk 头 @@、index 行等）原样输出
+            _ => buf.push_str(std::str::from_utf8(line.content()).unwrap_or("")),
+        }
+        true
+    })
+    .map_err(to_err)?;
+    Ok(buf)
+}
+
 #[tauri::command]
 fn get_diff(state: tauri::State<AppState>, oid: String) -> Result<String, String> {
     with_repo!(state, repo, {
         let diff = commit_diff(repo, &oid)?;
-        let mut buf = String::new();
-        diff.print(DiffFormat::Patch, |delta, _hunk, line| {
-            match line.origin() {
-                // 增删/上下文行：带前缀输出
-                '+' | '-' | ' ' => {
-                    buf.push(line.origin());
-                    buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
-                }
-                // 文件头：转成我们自己的分隔行，前端好按文件分段渲染
-                'F' => {
-                    if let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy()) {
-                        buf.push_str(&format!("\n=== {path} ===\n"));
-                    }
-                }
-                // 其余（hunk 头 @@、index 行等）原样输出
-                _ => buf.push_str(std::str::from_utf8(line.content()).unwrap_or("")),
-            }
-            true
-        })
-        .map_err(to_err)?;
-        Ok(buf)
+        patch_to_string(diff)
+    })
+}
+
+/// 读取工作区文件内容（左栏文件树点击预览用）。
+/// 防御：拒绝含 .. 的路径逃逸；超过 512KB 截断；含 NUL 视为二进制拒绝预览。
+#[tauri::command]
+fn read_file_content(state: tauri::State<AppState>, path: String) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let rel = std::path::Path::new(&path);
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("非法路径".to_string());
+        }
+        let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        let full = workdir.join(rel);
+        if !full.starts_with(workdir) {
+            return Err("非法路径".to_string());
+        }
+        let bytes = std::fs::read(&full).map_err(|e| format!("读取失败: {e}"))?;
+        const LIMIT: usize = 512 * 1024;
+        let (slice, truncated) = if bytes.len() > LIMIT {
+            (&bytes[..LIMIT], true)
+        } else {
+            (&bytes[..], false)
+        };
+        if slice.contains(&0) {
+            return Err("二进制文件不支持预览".to_string());
+        }
+        let mut text = String::from_utf8_lossy(slice).to_string();
+        if truncated {
+            text.push_str("\n\n…（文件过大，仅显示前 512KB）");
+        }
+        Ok(text)
+    })
+}
+
+/// 单文件的工作区 diff（HEAD+index → workdir），点「更改」列表里的文件看对比用。
+/// include_untracked 让新文件整体以 "+" 行呈现；文件无改动时返回空串，前端显示提示。
+#[tauri::command]
+fn get_workdir_diff(state: tauri::State<AppState>, path: String) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        let mut opts = git2::DiffOptions::new();
+        opts.pathspec(&path)
+            .context_lines(3)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true);
+        let diff = repo
+            .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
+            .map_err(to_err)?;
+        patch_to_string(diff)
     })
 }
 
@@ -802,6 +861,8 @@ pub fn run() {
             get_log,
             get_commit_files,
             get_diff,
+            read_file_content,
+            get_workdir_diff,
             get_head_tree,
             get_status,
             checkout_branch,

@@ -85,18 +85,32 @@ function buildTree(paths: string[]): TreeNode[] {
   return root;
 }
 
-function FileTreeView({ nodes, depth = 0 }: { nodes: TreeNode[]; depth?: number }) {
+function FileTreeView({
+  nodes,
+  depth = 0,
+  onFileClick,
+}: {
+  nodes: TreeNode[];
+  depth?: number;
+  onFileClick?: (path: string) => void;
+}) {
   return (
     <ul className="file-tree" style={{ paddingLeft: depth === 0 ? 0 : 14 }}>
       {nodes.map((n) => (
         <li key={n.path}>
-          <span className={`tree-label ${n.isFile ? "file" : "dir"}`}>
+          <span
+            className={`tree-label ${n.isFile ? "file" : "dir"}`}
+            onClick={() => n.isFile && onFileClick?.(n.path)}
+            title={n.isFile ? `${n.path}（点击在中栏预览）` : n.path}
+          >
             <span className={`tree-icon ${n.isFile ? "file" : "dir"}`}>
               {n.isFile ? "📄" : "📁"}
             </span>
             {n.name}
           </span>
-          {n.children.length > 0 && <FileTreeView nodes={n.children} depth={depth + 1} />}
+          {n.children.length > 0 && (
+            <FileTreeView nodes={n.children} depth={depth + 1} onFileClick={onFileClick} />
+          )}
         </li>
       ))}
     </ul>
@@ -196,8 +210,8 @@ function CommitGraph({ row, laneCount, isLast }: { row: GraphRow; laneCount: num
 
 // ---------- diff 渲染 ----------
 
-function DiffView({ text }: { text: string }) {
-  if (!text) return <div className="empty-hint">选择左侧提交查看改动</div>;
+function DiffView({ text, hint = "选择左侧提交查看改动" }: { text: string; hint?: string }) {
+  if (!text) return <div className="empty-hint">{hint}</div>;
   return (
     <pre className="diff-pre">
       {text.split("\n").map((line, i) => {
@@ -214,6 +228,26 @@ function DiffView({ text }: { text: string }) {
       })}
     </pre>
   );
+}
+
+// ---------- 中栏标签页 ----------
+//
+// history 是固定首页签（提交历史，不可关闭）；file = 文件树预览；wdiff = 「更改」单文件对比。
+// 内容按需加载并缓存到 tabData（key = kind:path），refresh 时整体失效重拉。
+
+type CenterTab =
+  | { kind: "history" }
+  | { kind: "file"; path: string }
+  | { kind: "wdiff"; path: string };
+
+function tabKey(t: CenterTab): string {
+  return t.kind === "history" ? "history" : `${t.kind}:${t.path}`;
+}
+
+function tabLabel(t: CenterTab): string {
+  if (t.kind === "history") return "提交历史";
+  const base = t.path.split("/").pop() ?? t.path;
+  return t.kind === "wdiff" ? `对比 ${base}` : base;
 }
 
 // ---------- 状态徽标 ----------
@@ -280,6 +314,10 @@ function App() {
   const [remoteUrl, setRemoteUrl] = useState("");
   // [ahead, behind]：待 push / 待 pull 条数；null = 无上游（纯本地仓库）不显示角标
   const [syncCounts, setSyncCounts] = useState<[number, number] | null>(null);
+  // 中栏标签页工作区
+  const [tabs, setTabs] = useState<CenterTab[]>([{ kind: "history" }]);
+  const [activeTab, setActiveTab] = useState(0);
+  const [tabData, setTabData] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -302,10 +340,59 @@ function App() {
       setStatus(st);
       setStashes(s);
       setSyncCounts(ab);
+      // 已打开的文件/对比标签内容可能已过时，清空缓存让激活标签重拉
+      setTabData({});
     } catch (e) {
       setError(String(e));
     }
   }, [repo, filterBranch, filterQuery]);
+
+  // ---------- 中栏标签页 ----------
+
+  function openCenterTab(kind: "file" | "wdiff", path: string) {
+    const key = `${kind}:${path}`;
+    const idx = tabs.findIndex((t) => tabKey(t) === key);
+    if (idx >= 0) {
+      setActiveTab(idx);
+      return;
+    }
+    setTabs([...tabs, { kind, path }]);
+    setActiveTab(tabs.length);
+  }
+
+  function closeTab(i: number) {
+    if (tabs[i]?.kind === "history") return; // 首页签不可关闭
+    const next = tabs.filter((_, j) => j !== i);
+    setTabs(next);
+    if (activeTab === i) {
+      setActiveTab(Math.max(0, i - 1));
+    } else if (activeTab > i) {
+      setActiveTab(activeTab - 1);
+    }
+  }
+
+  const activeT = tabs[activeTab] ?? tabs[0];
+  const activeKey = activeT ? tabKey(activeT) : "history";
+
+  // 激活的文件/对比标签按需加载内容（结果缓存进 tabData，refresh 时清空重拉）
+  useEffect(() => {
+    if (!activeT || activeT.kind === "history") return;
+    if (tabData[activeKey] !== undefined) return;
+    let dead = false;
+    invoke<string>(activeT.kind === "file" ? "read_file_content" : "get_workdir_diff", {
+      path: activeT.path,
+    })
+      .then((c) => {
+        if (!dead) setTabData((m) => ({ ...m, [activeKey]: c }));
+      })
+      .catch((e) => {
+        if (!dead) setTabData((m) => ({ ...m, [activeKey]: `加载失败：${String(e)}` }));
+      });
+    return () => {
+      dead = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeKey, tabData]);
 
 // 打开仓库。路径一律显式传入（浏览…/最近列表/示例链接），输入框只做展示不承接输入
   async function openRepo(path: string) {
@@ -322,6 +409,10 @@ function App() {
       setFiles([]);
       setDiff("");
       setPathMenuOpen(false);
+      // 换仓库：标签页全部重置回「提交历史」
+      setTabs([{ kind: "history" }]);
+      setActiveTab(0);
+      setTabData({});
       // 异步记一条最近打开，失败不阻塞主流程；成功后刷新最近列表，更新菜单和欢迎页
       invoke("add_recent", { path: summary.path })
         .then(loadRecent)
@@ -876,7 +967,10 @@ function App() {
                 repo.isEmpty ? (
                   <div className="empty-hint">空仓库（尚无提交）</div>
                 ) : (
-                  <FileTreeView nodes={buildTree(tree)} />
+                  <FileTreeView
+                    nodes={buildTree(tree)}
+                    onFileClick={(p) => openCenterTab("file", p)}
+                  />
                 )
               ) : (
                 <div className="branch-tree">
@@ -925,7 +1019,12 @@ function App() {
             <div className="pane-body status-list">
               {status.length === 0 && <div className="empty-hint">工作区干净</div>}
               {status.map((s) => (
-                <div key={s.path} className="status-item" title={s.path}>
+                <div
+                  key={s.path}
+                  className="status-item clickable"
+                  title={`${s.path}（点击在中栏查看对比）`}
+                  onClick={() => openCenterTab("wdiff", s.path)}
+                >
                   <span className={`status-badge st-${s.status}`}>
                     {STATUS_LABEL[s.status] ?? "?"}
                   </span>
@@ -995,10 +1094,46 @@ function App() {
             </div>
           </aside>
 
-          {/* 中栏：提交历史（分支管理已挪到左栏分支树） */}
+          {/* 中栏：标签页工作区——「提交历史」固定首页签，文件预览/对比开新标签 */}
           <section className="pane center">
-            <div className="pane-title">提交历史（{commits.length}）</div>
-            <div className="filter-toolbar">
+            <div className="center-tabs">
+              {tabs.map((t, i) => (
+                <div
+                  key={tabKey(t)}
+                  className={`center-tab ${i === activeTab ? "active" : ""}`}
+                  title={t.kind === "history" ? "提交历史" : t.path}
+                  onClick={() => setActiveTab(i)}
+                >
+                  <span className="center-tab-label">{tabLabel(t)}</span>
+                  {t.kind !== "history" && (
+                    <button
+                      className="chip-x"
+                      title="关闭标签"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(i);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            {activeT?.kind !== "history" ? (
+              <div className="pane-body tab-view">
+                {tabData[activeKey] === undefined ? (
+                  <div className="empty-hint">加载中…</div>
+                ) : activeT.kind === "file" ? (
+                  <pre className="file-content">{tabData[activeKey]}</pre>
+                ) : (
+                  <DiffView text={tabData[activeKey]} hint="该文件当前没有工作区改动" />
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="pane-title">提交历史（{commits.length}）</div>
+                <div className="filter-toolbar">
               <select
                 value={filterBranch}
                 onChange={(e) => setFilterBranch(e.currentTarget.value)}
@@ -1133,6 +1268,8 @@ function App() {
                 </div>
               ))}
             </div>
+              </>
+            )}
           </section>
 
           {/* 右栏：提交详情头 + 文件变更 + diff */}
