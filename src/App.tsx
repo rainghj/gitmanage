@@ -1,7 +1,34 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Component } from "react";
+import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+
+// ---------- 错误边界：渲染崩溃时显示错误内容，避免黑屏无从排查 ----------
+
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string | null }
+> {
+  state = { error: null as string | null };
+
+  static getDerivedStateFromError(e: unknown) {
+    return { error: String(e) };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="error-boundary">
+          <h2>界面渲染出错</h2>
+          <pre>{this.state.error}</pre>
+          <button onClick={() => window.location.reload()}>重新加载</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ---------- 类型（对应 Rust 侧的 serde camelCase） ----------
 
@@ -696,7 +723,12 @@ function App() {
   }
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selected) {
+      // 取消选中（如打开文件/对比标签）时，右栏数据一并清空，不残留上一个提交的内容
+      setFiles([]);
+      setDiff("");
+      return;
+    }
     (async () => {
       try {
         const [fs, d] = await Promise.all([
@@ -980,7 +1012,8 @@ function App() {
           )}
         </div>
       ) : (
-        <div className="main">
+        // 文件/对比标签激活时右栏整栏隐藏，中栏工作区撑满（编辑器形态）
+        <div className={`main ${activeT?.kind !== "history" ? "no-right" : ""}`}>
           {/* 左栏：文件树 + 工作区状态 */}
           <aside className="pane left">
             {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 */}
@@ -1183,9 +1216,12 @@ function App() {
                       className="file-editor"
                       spellCheck={false}
                       value={tabDrafts[activeKey] ?? tabData[activeKey]}
-                      onChange={(e) =>
-                        setTabDrafts((m) => ({ ...m, [activeKey]: e.currentTarget.value }))
-                      }
+                      onChange={(e) => {
+                        // 注意：currentTarget 在事件分发结束后被 React 置 null，
+                        // 必须先取出 value 再进 setState 更新器，否则更新器执行时访问 null.value 崩溃
+                        const v = e.currentTarget.value;
+                        setTabDrafts((m) => ({ ...m, [activeKey]: v }));
+                      }}
                       onKeyDown={(e) => {
                         if ((e.ctrlKey || e.metaKey) && e.key === "s") {
                           e.preventDefault();
@@ -1340,7 +1376,8 @@ function App() {
             )}
           </section>
 
-          {/* 右栏：提交详情头 + 文件变更 + diff */}
+          {/* 右栏：提交详情头 + 文件变更 + diff（仅提交历史标签激活时显示） */}
+          {activeT?.kind === "history" && (
           <section className="pane right">
             {selectedCommit ? (
               <div className="commit-detail-head">
@@ -1377,6 +1414,7 @@ function App() {
               <DiffView text={diff} />
             </div>
           </section>
+          )}
         </div>
       )}
 

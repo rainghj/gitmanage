@@ -175,6 +175,36 @@ button.link {
   border-bottom: 1px solid var(--border);
 }
 
+/* 渲染崩溃兜底页（ErrorBoundary） */
+.error-boundary {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  color: var(--text);
+}
+
+.error-boundary h2 {
+  font-weight: 500;
+  color: var(--red);
+}
+
+.error-boundary pre {
+  max-width: 80%;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 /* ---------- 欢迎页 ---------- */
 
 .welcome {
@@ -357,6 +387,11 @@ button.link {
   display: grid;
   grid-template-columns: 260px 1fr 1.2fr;
   min-height: 0;
+}
+
+/* 文件/对比标签激活时：右栏不渲染，中栏工作区撑满剩余宽度（编辑器形态） */
+.main.no-right {
+  grid-template-columns: 260px 1fr;
 }
 
 .pane {
