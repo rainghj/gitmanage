@@ -458,6 +458,67 @@ fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Re
 
 // ---------- 暂存与提交 ----------
 
+// ---------- 远程操作（git CLI 侧车） ----------
+//
+// git2 编译时关掉了 https/ssh（default-features=false），网络操作交给系统 git 命令：
+// 这样能复用 Windows 凭据管理器 / SSH agent，也省掉 openssl 依赖。
+//
+// 关键：设置 GIT_TERMINAL_PROMPT=0，避免 git 在后台弹交互式凭据输入把界面卡死；
+// 缺凭据时会直接失败并把 git 的原始输出返回给前端展示。
+
+#[tauri::command]
+fn git_remote_op(
+    state: tauri::State<AppState>,
+    op: String, // "fetch" | "pull" | "push"
+    remote: Option<String>,
+    branch: Option<String>,
+) -> Result<String, String> {
+    if !matches!(op.as_str(), "fetch" | "pull" | "push") {
+        return Err(format!("不支持的操作: {op}"));
+    }
+    with_repo!(state, repo, {
+        let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        let remote_name = remote
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "origin".to_string());
+        let branch_name = branch
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+
+        let mut args = vec![op.clone(), remote_name];
+        if let Some(b) = branch_name {
+            args.push(b);
+        }
+
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(workdir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|e| format!("无法执行 git（是否已安装并在 PATH 中？）: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // git 习惯把进度信息写 stderr，两路都要收集
+        let combined = format!("{stdout}{stderr}");
+
+        if out.status.success() {
+            Ok(combined)
+        } else {
+            let hint = if combined.contains("could not read Username")
+                || combined.contains("Authentication failed")
+                || combined.contains("Permission denied")
+            {
+                "\n\n提示：凭据未提供。请在 Windows 凭据管理器中配置，或改用 SSH 远端地址。"
+            } else {
+                ""
+            };
+            Err(format!("git {op} 失败：\n{combined}{hint}"))
+        }
+    })
+}
+
 #[tauri::command]
 fn get_recent(app: tauri::AppHandle) -> Vec<RecentEntry> {
     let mut list = read_recent(&app);
@@ -558,6 +619,7 @@ pub fn run() {
             get_recent,
             add_recent,
             remove_recent,
+            git_remote_op,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

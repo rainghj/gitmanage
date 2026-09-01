@@ -619,6 +619,51 @@ button.ghost.small {
   text-align: center;
 }
 
+/* ---------- 顶部栏远程操作 ---------- */
+
+.remote-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: auto; /* 推到右侧 */
+}
+
+/* ---------- 控制台面板 ---------- */
+
+.console-bar {
+  border-top: 1px solid var(--border);
+  background: #0e0e0e;
+  display: flex;
+  flex-direction: column;
+  height: 200px;
+  flex-shrink: 0;
+}
+
+.console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.console-body {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 12px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 /* ---------- 滚动条 ---------- */
 
 ::-webkit-scrollbar {

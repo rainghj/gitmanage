@@ -261,6 +261,9 @@ function App() {
   const [filterBranch, setFilterBranch] = useState(""); // "" = 全部（HEAD）
   const [filterQuery, setFilterQuery] = useState("");
   const [recent, setRecent] = useState<RecentEntry[]>([]);
+  const [consoleText, setConsoleText] = useState("");
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [opBusy, setOpBusy] = useState<string | null>(null); // 当前正在执行的远程操作
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -385,6 +388,26 @@ function App() {
     }
   }
 
+  async function doRemoteOp(op: "fetch" | "pull" | "push") {
+    if (!repo) return;
+    setOpBusy(op);
+    setConsoleText(`> git ${op}\n`);
+    setConsoleOpen(true);
+    try {
+      const text = await invoke<string>("git_remote_op", {
+        op,
+        remote: null,
+        branch: null,
+      });
+      setConsoleText(`> git ${op}\n${text}`);
+      await refresh();
+    } catch (e) {
+      setConsoleText(`> git ${op} 失败\n${String(e)}`);
+    } finally {
+      setOpBusy(null);
+    }
+  }
+
   useEffect(() => {
     if (!selected) return;
     (async () => {
@@ -433,6 +456,41 @@ function App() {
           <span className="head-badge" title={current.commit}>
             ⎇ {current.name}
           </span>
+        )}
+        {repo && (
+          <div className="remote-actions">
+            <button
+              className="ghost small"
+              onClick={() => doRemoteOp("fetch")}
+              disabled={opBusy !== null}
+              title="git fetch"
+            >
+              {opBusy === "fetch" ? "…" : "↓ fetch"}
+            </button>
+            <button
+              className="ghost small"
+              onClick={() => doRemoteOp("pull")}
+              disabled={opBusy !== null}
+              title="git pull（当前分支）"
+            >
+              {opBusy === "pull" ? "…" : "↓ pull"}
+            </button>
+            <button
+              className="ghost small"
+              onClick={() => doRemoteOp("push")}
+              disabled={opBusy !== null}
+              title="git push（当前分支）"
+            >
+              {opBusy === "push" ? "…" : "↑ push"}
+            </button>
+            <button
+              className="ghost small"
+              onClick={() => setConsoleOpen((o) => !o)}
+              title={consoleOpen ? "隐藏控制台" : "显示控制台"}
+            >
+              {consoleOpen ? "▼" : "▲"} Console
+            </button>
+          </div>
         )}
       </header>
 
@@ -659,6 +717,22 @@ function App() {
               <DiffView text={diff} />
             </div>
           </section>
+        </div>
+      )}
+
+      {repo && consoleOpen && (
+        <div className="console-bar">
+          <div className="console-head">
+            <span>控制台输出</span>
+            <button
+              className="ghost small"
+              onClick={() => setConsoleText("")}
+              title="清空"
+            >
+              清空
+            </button>
+          </div>
+          <pre className="console-body">{consoleText || "(空)"}</pre>
         </div>
       )}
     </div>
