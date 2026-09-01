@@ -413,6 +413,26 @@ fn read_file_content(state: tauri::State<AppState>, path: String) -> Result<Stri
     })
 }
 
+/// 写回工作区文件内容（文件预览标签页的编辑保存用）。路径安全规则同 read_file_content。
+#[tauri::command]
+fn write_file_content(state: tauri::State<AppState>, path: String, content: String) -> Result<(), String> {
+    with_repo!(state, repo, {
+        let rel = std::path::Path::new(&path);
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("非法路径".to_string());
+        }
+        let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        let full = workdir.join(rel);
+        if !full.starts_with(workdir) {
+            return Err("非法路径".to_string());
+        }
+        std::fs::write(&full, content.as_bytes()).map_err(|e| format!("写入失败: {e}"))
+    })
+}
+
 /// 单文件的工作区 diff（HEAD+index → workdir），点「更改」列表里的文件看对比用。
 /// include_untracked 让新文件整体以 "+" 行呈现；文件无改动时返回空串，前端显示提示。
 #[tauri::command]
@@ -862,6 +882,7 @@ pub fn run() {
             get_commit_files,
             get_diff,
             read_file_content,
+            write_file_content,
             get_workdir_diff,
             get_head_tree,
             get_status,

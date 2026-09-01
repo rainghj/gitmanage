@@ -759,16 +759,60 @@ button.ghost.small {
   text-overflow: ellipsis;
 }
 
-/* 文件预览标签页内容 */
+/* 文件预览/编辑标签页内容 */
 .tab-view {
   flex: 1;
+  display: flex;
+  flex-direction: column;
 }
 
-.file-content {
+/* 标签上的未保存圆点 */
+.tab-dirty {
+  color: var(--yellow);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.file-edit-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.file-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.file-edit-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: Consolas, "Courier New", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-editor {
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 8px 12px;
   font-family: Consolas, "Courier New", monospace;
   font-size: 12px;
   line-height: 1.45;
-  padding: 8px 12px;
   white-space: pre;
 }
 

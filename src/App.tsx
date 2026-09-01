@@ -318,6 +318,8 @@ function App() {
   const [tabs, setTabs] = useState<CenterTab[]>([{ kind: "history" }]);
   const [activeTab, setActiveTab] = useState(0);
   const [tabData, setTabData] = useState<Record<string, string>>({});
+  // 文件标签的未保存草稿（key = tabKey）；与 tabData 分离，refresh 清缓存时草稿不丢
+  const [tabDrafts, setTabDrafts] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -350,6 +352,8 @@ function App() {
   // ---------- 中栏标签页 ----------
 
   function openCenterTab(kind: "file" | "wdiff", path: string) {
+    // 焦点转到中栏标签页：取消提交历史的选中，右栏回到空提示，避免"右边还显示着旧提交"的困惑
+    setSelected(null);
     const key = `${kind}:${path}`;
     const idx = tabs.findIndex((t) => tabKey(t) === key);
     if (idx >= 0) {
@@ -373,6 +377,39 @@ function App() {
 
   const activeT = tabs[activeTab] ?? tabs[0];
   const activeKey = activeT ? tabKey(activeT) : "history";
+  // 文件标签的脏状态：草稿存在且与已加载内容不同
+  const isDirty = (t: CenterTab) =>
+    t.kind === "file" && tabDrafts[tabKey(t)] !== undefined && tabDrafts[tabKey(t)] !== tabData[tabKey(t)];
+
+  async function saveFileTab(t: CenterTab) {
+    if (t.kind !== "file") return;
+    const key = tabKey(t);
+    const content = tabDrafts[key];
+    if (content === undefined) return;
+    try {
+      await invoke("write_file_content", { path: t.path, content });
+      setTabData((m) => ({ ...m, [key]: content }));
+      setTabDrafts((m) => {
+        const n = { ...m };
+        delete n[key];
+        return n;
+      });
+      // 保存会影响「更改」列表，刷新一下
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function discardFileTab(t: CenterTab) {
+    if (t.kind !== "file") return;
+    const key = tabKey(t);
+    setTabDrafts((m) => {
+      const n = { ...m };
+      delete n[key];
+      return n;
+    });
+  }
 
   // 激活的文件/对比标签按需加载内容（结果缓存进 tabData，refresh 时清空重拉）
   useEffect(() => {
@@ -1104,6 +1141,7 @@ function App() {
                   title={t.kind === "history" ? "提交历史" : t.path}
                   onClick={() => setActiveTab(i)}
                 >
+                  {isDirty(t) && <span className="tab-dirty">●</span>}
                   <span className="center-tab-label">{tabLabel(t)}</span>
                   {t.kind !== "history" && (
                     <button
@@ -1125,7 +1163,37 @@ function App() {
                 {tabData[activeKey] === undefined ? (
                   <div className="empty-hint">加载中…</div>
                 ) : activeT.kind === "file" ? (
-                  <pre className="file-content">{tabData[activeKey]}</pre>
+                  <div className="file-edit-wrap">
+                    <div className="file-edit-bar">
+                      <span className="file-edit-path" title={activeT.path}>
+                        {activeT.path}
+                      </span>
+                      {isDirty(activeT) && (
+                        <>
+                          <button className="ghost small" onClick={() => saveFileTab(activeT)}>
+                            保存（Ctrl+S）
+                          </button>
+                          <button className="ghost small" onClick={() => discardFileTab(activeT)}>
+                            放弃修改
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    <textarea
+                      className="file-editor"
+                      spellCheck={false}
+                      value={tabDrafts[activeKey] ?? tabData[activeKey]}
+                      onChange={(e) =>
+                        setTabDrafts((m) => ({ ...m, [activeKey]: e.currentTarget.value }))
+                      }
+                      onKeyDown={(e) => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+                          e.preventDefault();
+                          saveFileTab(activeT);
+                        }
+                      }}
+                    />
+                  </div>
                 ) : (
                   <DiffView text={tabData[activeKey]} hint="该文件当前没有工作区改动" />
                 )}
