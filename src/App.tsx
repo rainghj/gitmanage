@@ -395,6 +395,8 @@ function App() {
   const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
   // 更改/不提交列表项的右键菜单
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; inSkip: boolean } | null>(null);
+  // 「放弃更改」的二次确认弹窗（值为待确认的文件路径）
+  const [discardConfirm, setDiscardConfirm] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -727,6 +729,20 @@ function App() {
       setCtxMenu(null);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // 放弃更改：已跟踪文件从索引还原，未跟踪文件直接删除（后端语义）
+  async function discardFile(path: string) {
+    try {
+      const msg = await invoke<string>("discard_file_changes", { path });
+      setDiscardConfirm(null);
+      setConsoleText(`> 放弃更改\n${msg}`);
+      setConsoleOpen(true);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+      setDiscardConfirm(null);
     }
   }
 
@@ -1586,13 +1602,47 @@ function App() {
                 ↩ 移回「更改」
               </button>
             ) : (
-              <button
-                className="recent-menu-item"
-                onClick={() => toggleSkip(ctxMenu.path, true)}
-              >
-                ⏏ 移到「不提交」（本地保留改动，不参与提交）
-              </button>
+              <>
+                <button
+                  className="recent-menu-item"
+                  onClick={() => toggleSkip(ctxMenu.path, true)}
+                >
+                  ⏏ 移到「不提交」（本地保留改动，不参与提交）
+                </button>
+                <button
+                  className="recent-menu-item danger"
+                  onClick={() => {
+                    setDiscardConfirm(ctxMenu.path);
+                    setCtxMenu(null);
+                  }}
+                >
+                  ✕ 放弃更改…（不可恢复）
+                </button>
+              </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 「放弃更改」二次确认弹窗 */}
+      {discardConfirm && (
+        <div className="ctx-overlay dim" onClick={() => setDiscardConfirm(null)}>
+          <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title">确认放弃更改？</div>
+            <div className="confirm-path" title={discardConfirm}>
+              {discardConfirm}
+            </div>
+            <div className="confirm-desc">
+              已跟踪文件将还原到上次提交的内容；未跟踪的新文件会被直接删除。此操作不可恢复。
+            </div>
+            <div className="confirm-actions">
+              <button className="danger-btn" onClick={() => discardFile(discardConfirm)}>
+                确认放弃
+              </button>
+              <button className="ghost" onClick={() => setDiscardConfirm(null)}>
+                取消
+              </button>
+            </div>
           </div>
         </div>
       )}

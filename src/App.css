@@ -897,6 +897,14 @@ button.ghost.small {
   z-index: 300;
 }
 
+/* 带压暗背景的遮罩（确认弹窗用） */
+.ctx-overlay.dim {
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .ctx-menu {
   position: fixed;
   min-width: 220px;
@@ -905,6 +913,60 @@ button.ghost.small {
   border: 1px solid var(--border);
   border-radius: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+/* 右键菜单里的危险项 */
+.recent-menu-item.danger:hover {
+  color: var(--red);
+}
+
+/* 「放弃更改」确认弹窗 */
+.confirm-box {
+  width: min(420px, 90vw);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.confirm-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--red);
+}
+
+.confirm-path {
+  margin-top: 8px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-desc {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.confirm-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.danger-btn {
+  background: #a32d2d;
+}
+
+.danger-btn:hover {
+  background: #c93b3b;
+  filter: none;
 }
 
 /* ---------- 提交列表 ---------- */

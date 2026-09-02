@@ -706,6 +706,30 @@ fn stage_files(state: tauri::State<AppState>, paths: Vec<String>) -> Result<usiz
     })
 }
 
+/// 放弃单个文件的工作区改动（不可恢复，前端必须确认后才调用）。
+/// - 已跟踪文件：从索引检出覆盖工作区（等价 git checkout -- <path>）
+/// - 未跟踪文件：直接删除（等价扔掉新建的文件）
+/// - 工作区已删除的跟踪文件：同样从索引检出 = 还原回来
+#[tauri::command]
+fn discard_file_changes(state: tauri::State<AppState>, path: String) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let rel = std::path::Path::new(&path);
+        let st = repo.status_file(rel).map_err(to_err)?;
+        if st.contains(git2::Status::WT_NEW) {
+            let full = repo
+                .workdir()
+                .ok_or("裸仓库不支持此操作")?
+                .join(rel);
+            std::fs::remove_file(&full).map_err(|e| format!("删除失败: {e}"))?;
+            return Ok(format!("已删除未跟踪文件: {path}"));
+        }
+        let mut opts = git2::build::CheckoutBuilder::new();
+        opts.path(&path).force();
+        repo.checkout_index(None, Some(&mut opts)).map_err(to_err)?;
+        Ok(format!("已放弃改动: {path}"))
+    })
+}
+
 // ---------- 远程操作（git CLI 侧车） ----------
 //
 // git2 编译时关掉了 https/ssh（default-features=false），网络操作交给系统 git 命令：
@@ -968,6 +992,7 @@ pub fn run() {
             delete_branch,
             stage_all,
             stage_files,
+            discard_file_changes,
             get_skip_list,
             set_skip,
             commit,
