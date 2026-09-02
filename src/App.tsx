@@ -397,6 +397,8 @@ function App() {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; inSkip: boolean } | null>(null);
   // 「放弃更改」的二次确认弹窗（值为待确认的文件路径）
   const [discardConfirm, setDiscardConfirm] = useState<string | null>(null);
+  // Stash 区默认折叠（低频功能），点标题展开
+  const [stashOpen, setStashOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -998,18 +1000,6 @@ function App() {
             ⎇ {current.name}
           </span>
         )}
-        {repo && (
-          // fetch/pull/push 已移到中栏过滤条右侧——它们是针对提交历史的操作，顶栏只留仓库级操作
-          <div className="remote-actions">
-            <button
-              className="ghost small"
-              onClick={() => setConsoleOpen((o) => !o)}
-              title={consoleOpen ? "隐藏控制台" : "显示控制台"}
-            >
-              {consoleOpen ? "▼" : "▲"} Console
-            </button>
-          </div>
-        )}
       </header>
 
       {error && <div className="error-bar">⚠ {error}</div>}
@@ -1113,8 +1103,8 @@ function App() {
           )}
         </div>
       ) : (
-        // 文件/对比标签激活时右栏整栏隐藏，中栏工作区撑满（编辑器形态）
-        <div className={`main ${activeT?.kind !== "history" ? "no-right" : ""}`}>
+        // 布局：左栏 | 工作区列（中栏+右栏在上，控制台在下，控制台不压左栏）
+        <div className="main">
           {/* 左栏：文件树 + 工作区状态 */}
           <aside className="pane left">
             {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 */}
@@ -1272,7 +1262,14 @@ function App() {
               </>
             )}
 
-            <div className="pane-title">Stash（{stashes.length}）</div>
+            <div
+              className="pane-title clickable"
+              title={stashOpen ? "点击折叠" : "点击展开"}
+              onClick={() => setStashOpen((o) => !o)}
+            >
+              {stashOpen ? "▾" : "▸"} Stash（{stashes.length}）
+            </div>
+            {stashOpen && (
             <div className="pane-body stash-list">
               {stashes.length === 0 && <div className="empty-hint">没有 stash</div>}
               {stashes.map((s) => (
@@ -1309,8 +1306,13 @@ function App() {
                 </div>
               ))}
             </div>
+            )}
           </aside>
 
+          {/* 工作区列：上 = 中栏+右栏，下 = 控制台 */}
+          <div className="workspace-col">
+            {/* 文件/对比标签激活时右栏整栏隐藏，中栏工作区撑满（编辑器形态） */}
+            <div className={`workspace-row ${activeT?.kind !== "history" ? "no-right" : ""}`}>
           {/* 中栏：标签页工作区——「提交历史」固定首页签，文件预览/对比开新标签 */}
           <section className="pane center">
             <div className="center-tabs">
@@ -1576,6 +1578,36 @@ function App() {
             </div>
           </section>
           )}
+            </div>
+
+            {/* 控制台：压在工作区列底部（不压左栏），标题栏图标折叠/展开 */}
+            <div className={`console-bar ${consoleOpen ? "open" : ""}`}>
+              <div className="console-head">
+                <span>控制台输出</span>
+                <div className="console-tools">
+                  {consoleOpen && (
+                    <button
+                      className="ghost small"
+                      onClick={() => setConsoleText("")}
+                      title="清空"
+                    >
+                      清空
+                    </button>
+                  )}
+                  <button
+                    className="ghost small"
+                    onClick={() => setConsoleOpen((o) => !o)}
+                    title={consoleOpen ? "折叠控制台" : "展开控制台"}
+                  >
+                    {consoleOpen ? "▾" : "▴"}
+                  </button>
+                </div>
+              </div>
+              {consoleOpen && (
+                <pre className="console-body">{consoleText || "(空)"}</pre>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1647,21 +1679,6 @@ function App() {
         </div>
       )}
 
-      {repo && consoleOpen && (
-        <div className="console-bar">
-          <div className="console-head">
-            <span>控制台输出</span>
-            <button
-              className="ghost small"
-              onClick={() => setConsoleText("")}
-              title="清空"
-            >
-              清空
-            </button>
-          </div>
-          <pre className="console-body">{consoleText || "(空)"}</pre>
-        </div>
-      )}
     </div>
   );
 }

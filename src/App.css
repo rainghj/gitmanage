@@ -382,16 +382,31 @@ button.link {
 
 /* ---------- 三栏 ---------- */
 
+/* 布局：左栏 | 工作区列（内容区 + 底部控制台） */
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 260px 1fr 1.2fr;
+  grid-template-columns: 260px 1fr;
   min-height: 0;
 }
 
-/* 文件/对比标签激活时：右栏不渲染，中栏工作区撑满剩余宽度（编辑器形态） */
-.main.no-right {
-  grid-template-columns: 260px 1fr;
+.workspace-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-row {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  min-height: 0;
+}
+
+/* 文件/对比标签激活时：右栏不渲染，中栏工作区撑满（编辑器形态） */
+.workspace-row.no-right {
+  grid-template-columns: 1fr;
 }
 
 .pane {
@@ -422,6 +437,16 @@ button.link {
 .pane-body {
   overflow: auto;
   min-height: 0;
+}
+
+/* 可点击的 pane-title（如 Stash 折叠/展开） */
+.pane-title.clickable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.pane-title.clickable:hover {
+  color: var(--text);
 }
 
 .left .pane-body {
@@ -1306,12 +1331,12 @@ button.ghost.small {
 
 /* ---------- 控制台面板 ---------- */
 
+/* 控制台：折叠时只有标题栏一条；展开时内容区 180px */
 .console-bar {
   border-top: 1px solid var(--border);
   background: #0e0e0e;
   display: flex;
   flex-direction: column;
-  height: 200px;
   flex-shrink: 0;
 }
 
@@ -1325,7 +1350,21 @@ button.ghost.small {
   letter-spacing: 0.5px;
   color: var(--text-dim);
   background: var(--panel);
+}
+
+.console-tools {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.console-bar.open .console-head {
   border-bottom: 1px solid var(--border);
+}
+
+.console-body {
+  flex: none;
+  height: 180px;
 }
 
 .console-body {
