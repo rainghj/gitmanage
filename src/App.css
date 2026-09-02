@@ -1552,6 +1552,9 @@ button.ghost.small {
 /* ---------- 三路合并面板（MergePanel） ---------- */
 
 .merge-panel {
+  /* 合并面板内复用的固定列宽：行号列 / 采纳按钮槽位 */
+  --ln-w: 36px;
+  --slot-w: 18px;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -1613,8 +1616,14 @@ button.ghost.small {
   text-overflow: ellipsis;
 }
 
-.m3-col-heads span:last-child {
+/* 逐块模式（有行号列）：表头文字与正文文本起点对齐（正文每窗格 = 行号列 + 文本） */
+.m3-col-heads.m3-col-heads-ln span {
+  padding-left: calc(var(--ln-w) + 8px);
+}
+/* 右窗格正文前还有 « 按钮槽位，表头多缩进一档 */
+.m3-col-heads.m3-col-heads-ln span:last-child {
   border-right: none;
+  padding-left: calc(var(--ln-w) + var(--slot-w) + 8px);
 }
 
 .m3-grid {
@@ -1647,14 +1656,32 @@ button.ghost.small {
   border-right: none;
 }
 
-/* cell 内的文本占满剩余空间，按钮固定 24px；文本过长 ellipsis 截断 */
+/* cell 内部 = 行号列 + 文本（+ 窗格内缘的 » « 按钮） */
 .m3-cell-text {
   flex: 1;
-  padding: 0 10px;
+  padding: 0 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: pre;
   min-width: 0;
+}
+
+/* 行号列（对齐 IDEA 各窗格独立真实行号）；行号不可选中 */
+.m3-lineno {
+  flex: 0 0 var(--ln-w);
+  padding: 0 6px 0 2px;
+  text-align: right;
+  font-size: 11px;
+  line-height: 18px;
+  color: #6e7681;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* 采纳按钮的空白槽位：ctx 行用它占住 » « 按钮列宽，保证三列文本起点一致 */
+.m3-adopt-slot {
+  flex: 0 0 var(--slot-w);
 }
 
 /* 上下文行：三侧一致，弱化 */
@@ -1662,53 +1689,62 @@ button.ghost.small {
   color: var(--text-dim);
 }
 
-/* 行级采纳按钮：放在中间「解决结果」列的两侧边缘 —— 用户在中间结果列旁点按钮
-   决定采纳本地还是远程（VS Code 3-way 风格，操作集中在结果列） */
+/* 改动区采纳按钮（IDEA 的 » «）：只出现在改动区首行，一次采纳整段。
+   常显柔和灰（不再是逐行 hover 才亮），悬停高亮，整区已采纳常显绿 */
 .m3-adopt {
-  flex: 0 0 24px;
+  flex: 0 0 var(--slot-w);
   background: transparent;
   border: none;
-  color: var(--accent);
+  border-radius: 3px;
+  color: #8d8d8d;
+  opacity: 0.9;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 12px;
   line-height: 18px;
+  font-weight: 600;
   user-select: none;
   padding: 0;
 }
-.m3-cell.result .m3-adopt.ours {
-  border-right: 1px solid var(--border); /* 与结果文本分隔 */
-}
-.m3-cell.result .m3-adopt.theirs {
-  border-left: 1px solid var(--border);
-}
 .m3-adopt:hover {
-  background: var(--panel-2);
+  background: rgba(86, 156, 214, 0.22);
   color: var(--accent-2);
+  filter: none;
+}
+.m3-adopt.picked {
+  color: var(--green);
+}
+.m3-adopt.picked:hover {
+  background: rgba(78, 201, 176, 0.18);
+  color: var(--green);
 }
 .m3-adopt:disabled {
   cursor: default;
-  opacity: 0.6;
+  opacity: 0.4;
+}
+.m3-adopt.picked:disabled {
+  color: var(--green);
+  opacity: 0.9;
 }
 
-/* 仅本地/仅远程的行：整行强调底色，便于一眼定位差异 */
-.m3-grid .ours-only .m3-cell.a,
-.m3-grid .ours-only .m3-cell.result {
-  background: rgba(78, 201, 176, 0.12); /* 本地侧：teal 淡底 */
+/* 单侧独立改动（无冲突，可安全自动采纳）：淡绿底 —— IDEA 的「修改/新增行」 */
+.m3-grid .change.ours-only .m3-cell.a,
+.m3-grid .change.theirs-only .m3-cell.b {
+  background: rgba(78, 201, 176, 0.1);
 }
 
-.m3-grid .theirs-only .m3-cell.b,
-.m3-grid .theirs-only .m3-cell.result {
-  background: rgba(87, 156, 214, 0.12); /* 远程侧：蓝淡底 */
+/* 真冲突行（同一区域两侧各改了不同内容）：淡红底 —— IDEA 的「冲突行」；
+   空白侧也上底色，显示「洞」的位置 */
+.m3-grid .clash .m3-cell.a,
+.m3-grid .clash .m3-cell.b {
+  background: rgba(244, 135, 113, 0.1);
+}
+.m3-grid .clash .m3-cell.result {
+  background: rgba(244, 135, 113, 0.05);
 }
 
-/* 行已被采纳的那一格（侧按钮高亮）；result 列在行级采纳后用更深的强调色 */
-.m3-cell.a .m3-adopt:active,
-.m3-cell.b .m3-adopt:active {
-  background: rgba(78, 201, 176, 0.18);
-}
-
-.m3-cell.result.adopted {
-  background: rgba(78, 201, 176, 0.18);
+/* 已采纳的结果格：绿底（IDEA 中接受后的更改在中央窗格保持高亮）；须压过 clash 红底 */
+.m3-grid .m3-cell.result.adopted {
+  background: rgba(78, 201, 176, 0.14);
 }
 
 /* ⊕ 占位：Accept Both 模式下，result 列不显示文本，只标记该行所在块已双侧采纳 */
@@ -1716,12 +1752,70 @@ button.ghost.small {
   color: var(--border);
   user-select: none;
 }
+/* 迷你操作按钮（工具栏无冲突组 / 块头符号按钮）：IDEA 风格的小符号，默认灰、悬停亮起 */
+.m3-mini {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-dim);
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+.m3-mini:hover {
+  background: var(--panel);
+  color: var(--accent);
+  border-color: var(--border);
+  filter: none;
+}
+.m3-mini:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.m3-mini.done,
+.m3-mini.done:hover {
+  color: var(--green);
+}
+
+/* 顶部工具栏的「无冲突更改」按钮组（对齐 IDEA 的 Apply non-conflicting changes） */
+.m3-tb-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 3px;
+  background: var(--bg);
+}
+.m3-tb-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 4px 0 6px;
+  user-select: none;
+  white-space: nowrap;
+}
+.m3-tb-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+}
+
+/* 块级采纳符号 » « 略醒目一点（对应 IDEA 冲突区边界上的接受按钮） */
+.m3-block-accept {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 7px;
+}
+
 .m3-block-bar {
   width: 100%;
   display: grid;
   grid-template-columns: 1fr 1fr 1fr; /* 与下方 m3-row 三列对齐：左/中/右各占一格 */
   align-items: center;
-  padding: 2px 10px;
+  padding: 1px 6px;
   background: var(--panel-2);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -1731,57 +1825,31 @@ button.ghost.small {
   z-index: 2;
 }
 
-/* 块头三列单元（左/中/右），与下方 m3-cell 列宽对齐 */
+/* 块头三列单元（左/中/右），与下方 m3-cell 列宽对齐；
+   左右按钮贴向中间窗格分界（IDEA 的按钮就在窗格边界上） */
 .m3-block-side {
   display: flex;
   align-items: center;
-  padding: 0 6px;
+  padding: 0 2px;
   min-width: 0;
 }
 .m3-block-side.left {
-  justify-content: flex-start;
+  justify-content: flex-end;
 }
 .m3-block-side.right {
-  justify-content: flex-end;
+  justify-content: flex-start;
 }
 
 .m3-block-mid {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
 }
 
-/* 块级采纳按钮：大字符箭头让"整块采纳"动作很醒目（对应 IDEA 的 >>> <<<） */
-.m3-block-adopt {
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  color: var(--accent);
-  padding: 2px 8px;
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-  font-family: inherit;
-}
-.m3-block-adopt:hover {
-  background: var(--panel);
-  color: var(--accent-2);
-  border-color: var(--accent-2);
-  filter: none;
-}
-.m3-block-adopt:disabled {
-  cursor: default;
-  opacity: 0.6;
-}
-.m3-block-adopt.done {
-  border-color: var(--green);
-  color: var(--green);
-}
-
 .m3-block-bar.done {
-  background: rgba(78, 201, 176, 0.18);
+  background: rgba(78, 201, 176, 0.08);
 }
 
 .m3-block-no {
@@ -1821,12 +1889,22 @@ button.ghost.small {
   word-break: break-all;
 }
 
-.merge-tip {
-  padding: 4px 10px;
-  font-size: 11px;
-  color: var(--text-dim);
+/* IDEA 风格底栏：左侧「全部采用…」操作，右侧提示 + 主按钮「标记已解决」 */
+.merge-bottombar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
   border-top: 1px solid var(--border);
   background: var(--panel);
+}
+.merge-tip-inline {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 /* 编辑模式下（file tab）修改冲突文件后再回到冲突页时，提示栏可复用 */

@@ -489,14 +489,18 @@ function MergePanel({
   const fileBinary =
     sides !== null && sides !== undefined && sides.ours === null && sides.theirs === null;
 
-  // 行级采纳：把某块第 rowIdx 行设为 ours/theirs；both 状态会被关掉（行级粒度优先）
-  const pickRow = (blockId: number, rowIdx: number, side: "ours" | "theirs") =>
+  // 改动区采纳（IDEA 风格）：把某块内第 regionNo 个「改动区」的全部行设为 ours/theirs。
+  // 改动区 = alignLines 的连续孤儿区，一次点击采纳整区（不再是逐行点按钮）
+  const pickRegion = (blockId: number, regionNo: number, side: "ours" | "theirs") => {
+    const idxs = blockRegions[blockId]?.[regionNo];
+    if (!idxs || idxs.length === 0) return;
     setPicks((m) => {
       const cur = m[blockId] ?? { sides: [], both: false };
       const sides = cur.sides.slice();
-      sides[rowIdx] = side;
+      for (const r of idxs) sides[r] = side;
       return { ...m, [blockId]: { sides, both: false } };
     });
+  };
 
   // 整块快速采纳：把该块所有行都设为 ours/theirs（覆盖既有行级选择）
   const pickBlock = (blockId: number, side: "ours" | "theirs") =>
@@ -614,16 +618,84 @@ function MergePanel({
   const rows = useMemo(() => {
     if (!parsed || parsed.whole) return null;
     type Row =
-      | { t: "ctx"; line: string }
+      | { t: "ctx"; line: string; no: number }
       | { t: "bar"; id: number }
-      | { t: "pair"; id: number; rowIdx: number; a: string | null; b: string | null; common: boolean };
+      | {
+          t: "pair";
+          id: number;
+          rowIdx: number;
+          a: string | null;
+          b: string | null;
+          common: boolean;
+          clash: boolean;
+          /** 所属「改动区」（连续孤儿区，块内从 0 编号）；common 行为 -1 */
+          region: number;
+          /** 该行是所属改动区内第一个有本地内容的行 → 在此渲染 » 按钮（采纳整区本地） */
+          firstA: boolean;
+          /** 该行是所属改动区内第一个有远程内容的行 → 在此渲染 « 按钮（采纳整区远程） */
+          firstB: boolean;
+          /** 该展示行在左（ours）源文件中的行号；a 无内容时为 0 */
+          aNo: number;
+          /** 该展示行在右（theirs）源文件中的行号；b 无内容时为 0 */
+          bNo: number;
+        };
     const out: Row[] = [];
+    // 行号按「各自源文件」累计：ctx 段两文件位置相同，行号同步推进；
+    // 冲突块内 ours/theirs 的行数可能不同，各自独立累计（对齐 IDEA 三列各自真实行号）
+    let offO = 0;
+    let offT = 0;
     for (const seg of parsed.segs) {
       if (seg.kind === "text") {
-        for (const line of seg.lines) out.push({ t: "ctx", line });
+        for (const line of seg.lines) {
+          out.push({ t: "ctx", line, no: offO + 1 });
+          offO++;
+          offT++;
+        }
       } else {
         out.push({ t: "bar", id: seg.id });
         const aligned = alignLines(seg.ours, seg.theirs);
+        const isPair = (r: [number | null, number | null]) => r[0] !== null && r[1] !== null;
+        // 每个「连续孤儿区」= 一个改动区（IDEA 的一处 change）：
+        //  - 区内只有一侧有内容 → 单侧改动（绿）
+        //  - 区内两侧都有内容 → 真冲突（红）
+        // 每个区只在「区首有内容的行」放采纳按钮（IDEA 的 » « 一次采纳整区）
+        const clash = new Array<boolean>(aligned.length).fill(false);
+        const region = new Array(aligned.length).fill(-1);
+        const firstA = new Array(aligned.length).fill(false);
+        const firstB = new Array(aligned.length).fill(false);
+        let regNo = 0;
+        let i = 0;
+        while (i < aligned.length) {
+          if (isPair(aligned[i])) {
+            i++;
+            continue;
+          }
+          let j = i;
+          let hasO = false;
+          let hasT = false;
+          while (j < aligned.length && !isPair(aligned[j])) {
+            if (aligned[j][0] !== null) hasO = true;
+            if (aligned[j][1] !== null) hasT = true;
+            j++;
+          }
+          const clashReg = hasO && hasT;
+          let aAnchor = false;
+          let bAnchor = false;
+          for (let k = i; k < j; k++) {
+            if (clashReg) clash[k] = true;
+            region[k] = regNo;
+            if (!aAnchor && aligned[k][0] !== null) {
+              aAnchor = true;
+              firstA[k] = true;
+            }
+            if (!bAnchor && aligned[k][1] !== null) {
+              bAnchor = true;
+              firstB[k] = true;
+            }
+          }
+          regNo++;
+          i = j;
+        }
         aligned.forEach(([ai, bi], rowIdx) => {
           out.push({
             t: "pair",
@@ -632,11 +704,44 @@ function MergePanel({
             a: ai !== null ? seg.ours[ai] : null,
             b: bi !== null ? seg.theirs[bi] : null,
             common: ai !== null && bi !== null,
+            clash: clash[rowIdx],
+            region: region[rowIdx],
+            firstA: firstA[rowIdx],
+            firstB: firstB[rowIdx],
+            aNo: ai !== null ? offO + ai + 1 : 0,
+            bNo: bi !== null ? offT + bi + 1 : 0,
           });
         });
+        offO += seg.ours.length;
+        offT += seg.theirs.length;
       }
     }
     return out;
+  }, [parsed]);
+
+  // 每个冲突块内各改动区覆盖的行 idx（按钮一次采纳整区）
+  const blockRegions = useMemo(() => {
+    const m: Record<number, number[][]> = {};
+    if (!parsed) return m;
+    for (const seg of parsed.segs) {
+      if (seg.kind !== "conflict") continue;
+      const aligned = alignLines(seg.ours, seg.theirs);
+      const regions: number[][] = [];
+      const isPair = (r: [number | null, number | null]) => r[0] !== null && r[1] !== null;
+      let i = 0;
+      while (i < aligned.length) {
+        if (isPair(aligned[i])) {
+          i++;
+          continue;
+        }
+        let j = i;
+        while (j < aligned.length && !isPair(aligned[j])) j++;
+        regions.push(Array.from({ length: j - i }, (_, k) => i + k));
+        i = j;
+      }
+      m[seg.id] = regions;
+    }
+    return m;
   }, [parsed]);
 
   // picks 按冲突块的"对齐后行数"初始化；用户已采纳的行/Accept Both 选择会保留
@@ -646,10 +751,16 @@ function MergePanel({
       const next: Picks = {};
       for (const seg of parsed.segs) {
         if (seg.kind !== "conflict") continue;
-        const rowCount = alignLines(seg.ours, seg.theirs).length;
+        const aligned = alignLines(seg.ours, seg.theirs);
         const old = prev[seg.id];
-        next[seg.id] =
-          old && old.sides.length === rowCount ? old : { sides: new Array(rowCount).fill(null), both: false };
+        const sides =
+          old && old.sides.length === aligned.length ? old.sides.slice() : new Array(aligned.length).fill(null);
+        // common 行（两侧内容相同，无争议）直接视为已采纳 ours——
+        // 避免它们阻塞「标记已解决」，也不需要逐行按钮
+        aligned.forEach((r, i) => {
+          if (r[0] !== null && r[1] !== null && sides[i] === null) sides[i] = "ours";
+        });
+        next[seg.id] = { sides, both: old?.both ?? false };
       }
       return next;
     });
@@ -799,45 +910,41 @@ function MergePanel({
           共 {totalBlocks} 处冲突 · 已采纳 {resolvedRows}/{totalRows} 行
         </span>
         <span className="spacer" />
-        <button
-          className="ghost small apply-nonconf"
-          title="自动采纳不冲突的行：两侧内容相同的行、以及只有一侧有的独立改动；真冲突（两侧在同一位置各改了不同内容）保持未选"
-          disabled={busy}
-          onClick={() => applyNonConf("both")}
-        >
-          ⇥ 应用无冲突
-        </button>
-        <button
-          className="ghost small"
-          title="只应用左侧（本地）的无冲突改动"
-          disabled={busy}
-          onClick={() => applyNonConf("ours")}
-        >
-          应用左侧无冲突
-        </button>
-        <button
-          className="ghost small"
-          title="只应用右侧（远程）的无冲突改动"
-          disabled={busy}
-          onClick={() => applyNonConf("theirs")}
-        >
-          应用右侧无冲突
-        </button>
-        <button className="ghost small" title="所有冲突块都整块采纳本地（HEAD），箭头指向中间结果列" disabled={busy} onClick={() => pickAll("ours")}>全部采用本地 →</button>
-        <button className="ghost small" title="所有冲突块都整块采纳远程（合入方），箭头指向中间结果列" disabled={busy} onClick={() => pickAll("theirs")}>← 全部采用远程</button>
-        <button className="ghost small" title="所有冲突块都「Accept Both」——ours 与 theirs 都纳入结果" disabled={busy} onClick={pickAllBoth}>全部接受两侧</button>
-        <button className="ghost small" onClick={() => onOpenFile(path)}>在编辑器中手动处理…</button>
-        <button className="ghost small" disabled={busy} onClick={onAbort}>放弃合并…</button>
-        <button
-          disabled={busy || !allResolved}
-          title={allResolved ? "写回合并结果并暂存（标记已解决）" : `还有 ${totalRows - resolvedRows} 行待采纳`}
-          onClick={doResolve}
-        >
-          标记已解决
-        </button>
+        {/* IDEA 风格：Apply non-conflicting changes 迷你按钮组（»左 »«全部 «右） */}
+        <span className="m3-tb-group">
+          <span className="m3-tb-label">无冲突更改</span>
+          <button
+            className="m3-mini"
+            title="只应用左侧（本地）的无冲突改动"
+            disabled={busy}
+            onClick={() => applyNonConf("ours")}
+          >
+            » 左
+          </button>
+          <button
+            className="m3-mini"
+            title="自动采纳所有不冲突的行：两侧内容相同的行、以及只有一侧有的独立改动；真冲突（两侧在同一位置各改了不同内容）保持未选"
+            disabled={busy}
+            onClick={() => applyNonConf("both")}
+          >
+            »« 全部
+          </button>
+          <button
+            className="m3-mini"
+            title="只应用右侧（远程）的无冲突改动"
+            disabled={busy}
+            onClick={() => applyNonConf("theirs")}
+          >
+            « 右
+          </button>
+        </span>
+        <span className="m3-tb-sep" />
+        <button className="ghost small" title="在编辑器中手动处理该文件" onClick={() => onOpenFile(path)}>编辑器…</button>
+        <button className="ghost small" title="放弃本次合并，回到合并前状态" disabled={busy} onClick={onAbort}>放弃合并…</button>
       </div>
       {errFlash}
-      <div className="m3-col-heads">
+      {/* 逐块模式：表头与正文的行号列对齐（整体模式无行号，不加该类） */}
+      <div className="m3-col-heads m3-col-heads-ln">
         <span>本地（HEAD）</span>
         <span>解决结果</span>
         <span>远程（合入方）</span>
@@ -847,9 +954,20 @@ function MergePanel({
           if (row.t === "ctx") {
             return (
               <div key={idx} className="m3-row">
-                <div className="m3-cell ctx" title="上下文（三侧一致）"><span className="m3-cell-text">{clean(row.line)}</span></div>
-                <div className="m3-cell ctx"><span className="m3-cell-text">{clean(row.line)}</span></div>
-                <div className="m3-cell ctx"><span className="m3-cell-text">{clean(row.line)}</span></div>
+                <div className="m3-cell a ctx" title="上下文（三侧一致）">
+                  <span className="m3-lineno">{row.no}</span>
+                  <span className="m3-cell-text">{clean(row.line)}</span>
+                </div>
+                <div className="m3-cell result ctx">
+                  <span className="m3-lineno">{row.no}</span>
+                  <span className="m3-cell-text">{clean(row.line)}</span>
+                </div>
+                {/* b 窗前导槽位与 pair 行的 « 按钮对齐，保证三列文本起点一致 */}
+                <div className="m3-cell b ctx">
+                  <span className="m3-adopt-slot" />
+                  <span className="m3-lineno">{row.no}</span>
+                  <span className="m3-cell-text">{clean(row.line)}</span>
+                </div>
               </div>
             );
           }
@@ -860,55 +978,56 @@ function MergePanel({
             const resolvedRowsInBlock = pick
               ? (pick.both ? blockRows : pick.sides.filter((s) => s !== null).length)
               : 0;
+            const allOurs = !both && !!pick && pick.sides.length > 0 && pick.sides.every((s) => s === "ours");
+            const allTheirs = !both && !!pick && pick.sides.length > 0 && pick.sides.every((s) => s === "theirs");
             return (
               <div key={idx} className={`m3-block-bar ${pick ? "done" : ""}`}>
-                {/* 左列上方的「>>>」块级采纳本地按钮 —— 对齐 IDEA 的位置 */}
+                {/* 块级采纳按钮贴在窗格分界处（IDEA 的小 » «，默认灰、悬停亮起） */}
                 <div className="m3-block-side left">
                   <button
-                    className={`m3-block-adopt ${pick && pick.sides.length > 0 && pick.sides.every((s) => s === "ours") ? "done" : ""}`}
+                    className={`m3-mini m3-block-accept ${allOurs ? "done" : ""}`}
                     disabled={busy}
                     title="整块采纳本地（HEAD）"
                     onClick={() => pickBlock(row.id, "ours")}
                   >
-                    整块本地 →
+                    »
                   </button>
                 </div>
-                {/* 中间：冲突编号 + 状态 + Accept Both */}
+                {/* 中间：冲突编号 + 状态 + 两个迷你操作 */}
                 <div className="m3-block-mid">
                   <span className="m3-block-no">冲突 {row.id + 1}/{totalBlocks}</span>
                   {both ? (
-                    <span className="m3-block-state">已采用：两侧都留</span>
+                    <span className="m3-block-state">两侧都留</span>
                   ) : pick && resolvedRowsInBlock > 0 ? (
                     <span className="m3-block-state">已采纳 {resolvedRowsInBlock}/{blockRows} 行</span>
                   ) : (
                     <span className="m3-block-state pending">未解决</span>
                   )}
                   <button
-                    className={`m3-block-adopt ${both ? "done" : ""}`}
+                    className={`m3-mini ${both ? "done" : ""}`}
                     disabled={busy || both}
-                    title="Accept Both：ours 与 theirs 全部按顺序纳入结果"
+                    title="两侧都留（Accept Both）：ours 与 theirs 全部按顺序纳入结果"
                     onClick={() => pickBlockBoth(row.id)}
                   >
-                    两侧都留
+                    ⊕
                   </button>
                   <button
-                    className="m3-block-adopt"
+                    className="m3-mini"
                     disabled={busy || both}
                     title="只对本块应用无冲突的更改（两侧相同 / 单侧独立改动自动采纳，真冲突保留）"
                     onClick={() => applyBlockNonConf(row.id)}
                   >
-                    应用无冲突
+                    ⇥
                   </button>
                 </div>
-                {/* 右列上方的「<<<」块级采纳远程按钮 —— 对齐 IDEA 的位置 */}
                 <div className="m3-block-side right">
                   <button
-                    className={`m3-block-adopt ${pick && pick.sides.length > 0 && pick.sides.every((s) => s === "theirs") ? "done" : ""}`}
+                    className={`m3-mini m3-block-accept ${allTheirs ? "done" : ""}`}
                     disabled={busy}
                     title="整块采纳远程（合入方）"
                     onClick={() => pickBlock(row.id, "theirs")}
                   >
-                    ← 整块远程
+                    «
                   </button>
                 </div>
               </div>
@@ -916,26 +1035,54 @@ function MergePanel({
           }
           const side = rowSide(row.id, row.rowIdx);
           const rText = resultTextFor(row, side);
-          const cls = row.common ? "m3-row" : row.a !== null ? "m3-row ours-only" : "m3-row theirs-only";
-          // 该 row 是否有任何侧内容：两侧都无内容时隐藏整行的采纳按钮（无意义）
-          const hasAnyContent = row.a !== null || row.b !== null;
+          // clash=真冲突（红）；单侧孤儿=独立改动（绿）；common=两侧一致（无底色）
+          const cls = row.common
+            ? "m3-row"
+            : row.clash
+              ? "m3-row clash"
+              : row.a !== null
+                ? "m3-row change ours-only"
+                : "m3-row change theirs-only";
+          // 中间结果列行号：采纳后跟随采纳侧的源行号；未采纳（含 common 未决）为空
+          const midNo =
+            side === "ours" || side === "both"
+              ? row.aNo || row.bNo
+              : side === "theirs"
+                ? row.bNo || row.aNo
+                : 0;
+          // 按钮只出现在改动区（region >= 0）区首对应侧有内容的行：
+          // » = 采纳整个改动区的本地内容，« = 采纳整个改动区的远程内容（IDEA 交互）
+          const showOurs = row.region >= 0 && row.firstA;
+          const showTheirs = row.region >= 0 && row.firstB;
+          // 按钮的「已采纳」状态按整区判定：区内所有行都采纳了同一侧才亮绿
+          const regRows = row.region >= 0 ? blockRegions[row.id]?.[row.region] : undefined;
+          const regPick = regRows ? picks[row.id] : undefined;
+          const regAllOurs =
+            !!regRows && !!regPick && !regPick.both && regRows.every((r) => regPick.sides[r] === "ours");
+          const regAllTheirs =
+            !!regRows && !!regPick && !regPick.both && regRows.every((r) => regPick.sides[r] === "theirs");
+          // common 行两侧相同视为已采纳（初始化即 ours），中列直接显示文本且不上绿底
+          const adoptedCls = side && !row.common ? " adopted" : "";
           return (
             <div key={idx} className={cls}>
+              {/* 左窗格：行号 + 文本 + 内缘 »（采纳整区本地）——按钮贴在窗格分界处 */}
               <div className={`m3-cell a${row.common ? " common" : ""}`}>
+                <span className="m3-lineno">{row.aNo || ""}</span>
                 <span className="m3-cell-text">{row.a !== null ? clean(row.a) : ""}</span>
-              </div>
-              <div className={`m3-cell result${side ? " adopted" : ""}`}>
-                {/* 中间结果列：左侧 → 按钮采纳本地、右侧 ← 按钮采纳远程，操作集中在结果列 */}
-                {hasAnyContent && (
+                {showOurs && (
                   <button
-                    className="m3-adopt ours"
-                    disabled={busy || row.a === null}
-                    title="采纳本地这一行（→ 指向结果列）"
-                    onClick={() => pickRow(row.id, row.rowIdx, "ours")}
+                    className={`m3-adopt ours${regAllOurs ? " picked" : ""}`}
+                    disabled={busy}
+                    title="采纳此改动的本地版本（整段进入中间结果列）"
+                    onClick={() => pickRegion(row.id, row.region, "ours")}
                   >
-                    →
+                    »
                   </button>
                 )}
+              </div>
+              {/* 中间结果列：只显示行号 + 结果文本，保持纯净（对齐 IDEA 的可编辑结果窗格） */}
+              <div className={`m3-cell result${adoptedCls}`}>
+                <span className="m3-lineno">{midNo || ""}</span>
                 <span className="m3-cell-text">
                   {side === "both"
                     ? <span className="m3-void">⊕</span>
@@ -943,27 +1090,40 @@ function MergePanel({
                       ? clean(rText)
                       : <span className="m3-void">·</span>}
                 </span>
-                {hasAnyContent && (
+              </div>
+              {/* 右窗格：内缘 «（采纳整区远程）+ 行号 + 文本 */}
+              <div className={`m3-cell b${row.common ? " common" : ""}`}>
+                {showTheirs && (
                   <button
-                    className="m3-adopt theirs"
-                    disabled={busy || row.b === null}
-                    title="采纳远程这一行（← 指向结果列）"
-                    onClick={() => pickRow(row.id, row.rowIdx, "theirs")}
+                    className={`m3-adopt theirs${regAllTheirs ? " picked" : ""}`}
+                    disabled={busy}
+                    title="采纳此改动的远程版本（整段进入中间结果列）"
+                    onClick={() => pickRegion(row.id, row.region, "theirs")}
                   >
-                    ←
+                    «
                   </button>
                 )}
-              </div>
-              <div className={`m3-cell b${row.common ? " common" : ""}`}>
+                <span className="m3-lineno">{row.bNo || ""}</span>
                 <span className="m3-cell-text">{row.b !== null ? clean(row.b) : ""}</span>
               </div>
             </div>
           );
         })}
       </div>
-      <div className="merge-tip">
-        提示：行末 ←/→ 箭头采纳该行；冲突块头有「整块本地/远程/两侧都留」快捷操作；
-        <span style={{ color: "var(--text-dim)" }}> ⊕ 表示该行所在块已 Accept Both</span>
+      {/* IDEA 风格底栏：Accept Left/Right 类操作在左，主操作「标记已解决」在右 */}
+      <div className="merge-bottombar">
+        <button className="ghost small" title="所有冲突块都整块采纳本地（HEAD）" disabled={busy} onClick={() => pickAll("ours")}>全部采用本地 »</button>
+        <button className="ghost small" title="所有冲突块都整块采纳远程（合入方）" disabled={busy} onClick={() => pickAll("theirs")}>« 全部采用远程</button>
+        <button className="ghost small" title="所有冲突块都「两侧都留」——ours 与 theirs 都纳入结果" disabled={busy} onClick={pickAllBoth}>全部接受两侧</button>
+        <span className="spacer" />
+        <span className="merge-tip-inline">改动区首行 » / « 一次采纳整段 · ⊕ 两侧都留 · ⇥ 应用无冲突</span>
+        <button
+          disabled={busy || !allResolved}
+          title={allResolved ? "写回合并结果并暂存（标记已解决）" : `还有 ${totalRows - resolvedRows} 行待采纳`}
+          onClick={doResolve}
+        >
+          标记已解决
+        </button>
       </div>
     </div>
   );
