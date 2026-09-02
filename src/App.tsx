@@ -935,7 +935,6 @@ function App() {
   const { rows: graphRows, laneCount } = useMemo(() => computeGraph(commits), [commits]);
   const localBranches = branches.filter((b) => !b.isRemote);
   const remoteBranches = branches.filter((b) => b.isRemote);
-  const current = branches.find((b) => b.isHead);
   // 更改列表拆成两部分：不提交列表里的文件单独成区，不参与勾选提交
   const visibleStatus = status.filter((s) => !skipList.includes(s.path));
   const skippedStatus = status.filter((s) => skipList.includes(s.path));
@@ -1084,11 +1083,6 @@ function App() {
           <button className="ghost" onClick={closeRepo} title="关闭当前仓库，回到欢迎页">
             关闭
           </button>
-        )}
-        {current && (
-          <span className="head-badge" title={current.commit}>
-            ⎇ {current.name}
-          </span>
         )}
       </header>
 

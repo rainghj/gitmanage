@@ -159,15 +159,6 @@ button.link {
   text-decoration: underline;
 }
 
-.head-badge {
-  background: var(--panel-2);
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  border-radius: 10px;
-  padding: 2px 10px;
-  white-space: nowrap;
-}
-
 .error-bar {
   background: #5a1d1d;
   color: var(--red);
