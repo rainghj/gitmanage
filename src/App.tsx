@@ -380,6 +380,44 @@ function DiffView({ text, hint = "选择左侧提交查看改动" }: { text: str
   );
 }
 
+// ---------- 布局拖拽分割 ----------
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** 数值 state 持久化到 localStorage（拖动过的布局尺寸重开应用保持） */
+function usePersistentNumber(key: string, def: number): [number, (v: number) => void] {
+  const [v, setV] = useState(() => {
+    const n = Number(localStorage.getItem(key));
+    return Number.isFinite(n) && n > 0 ? n : def;
+  });
+  const set = (nv: number) => {
+    setV(nv);
+    localStorage.setItem(key, String(nv));
+  };
+  return [v, set];
+}
+
+/** 通用拖拽：pointerdown + setPointerCapture 把事件捕获到元素自身
+ * （比 window mousemove 在 WebView2 里更可靠），期间锁定光标与文本选中 */
+function startDrag(e: React.PointerEvent<HTMLElement>, cursor: string, onMove: (ev: PointerEvent) => void) {
+  e.preventDefault();
+  const el = e.currentTarget;
+  el.setPointerCapture(e.pointerId);
+  document.body.style.cursor = cursor;
+  document.body.style.userSelect = "none";
+  const move = (ev: PointerEvent) => onMove(ev);
+  const end = () => {
+    el.removeEventListener("pointermove", move);
+    el.removeEventListener("pointerup", end);
+    el.removeEventListener("pointercancel", end);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  };
+  el.addEventListener("pointermove", move);
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+}
+
 // ---------- 中栏标签页 ----------
 //
 // history 是固定首页签（提交历史，不可关闭）；file = 文件树预览；wdiff = 「更改」单文件对比。
@@ -480,10 +518,23 @@ function App() {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; inSkip: boolean } | null>(null);
   // 「放弃更改」的二次确认弹窗（值为待确认的文件路径）
   const [discardConfirm, setDiscardConfirm] = useState<string | null>(null);
+  // 提交历史右键菜单（复制 hash / 提交信息）
+  const [commitCtx, setCommitCtx] = useState<{ x: number; y: number; oid: string; summary: string } | null>(null);
+  // 分支树右键菜单 + 重命名弹窗
+  const [branchCtx, setBranchCtx] = useState<{ x: number; y: number; name: string } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   // Stash 区默认折叠（低频功能），点标题展开
   const [stashOpen, setStashOpen] = useState(false);
   // 文件标签：默认高亮预览，点「编辑」才切到可编辑文本框
   const [fileEditMode, setFileEditMode] = useState(false);
+  // 布局尺寸（可拖动，localStorage 记忆）：左栏宽度 / 右栏占比 / 控制台高度
+  const [leftW, setLeftW] = usePersistentNumber("gm.leftW", 260);
+  const [rightShare, setRightShare] = usePersistentNumber("gm.rightShare", 0.545);
+  const [consoleH, setConsoleH] = usePersistentNumber("gm.consoleH", 180);
+  const workspaceRowRef = useRef<HTMLDivElement>(null);
+  // 提交历史分页：默认 300 条，列表底部「加载更多」每次 +300
+  const [logLimit, setLogLimit] = useState(300);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -491,7 +542,7 @@ function App() {
       const [bs, log, t, st, s, ab, sk] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
-          limit: 300,
+          limit: logLimit,
           branch: filterBranch || null,
           query: filterQuery.trim() || null,
         }),
@@ -513,7 +564,7 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, [repo, filterBranch, filterQuery]);
+  }, [repo, filterBranch, filterQuery, logLimit]);
 
   // ---------- 中栏标签页 ----------
 
@@ -602,6 +653,11 @@ function App() {
     setFileEditMode(false);
   }, [activeKey]);
 
+  // 过滤条件变化时重置回第一页
+  useEffect(() => {
+    setLogLimit(300);
+  }, [filterBranch, filterQuery]);
+
 // 打开仓库。路径一律显式传入（浏览…/最近列表/示例链接），输入框只做展示不承接输入
   async function openRepo(path: string) {
     path = path.trim();
@@ -623,6 +679,7 @@ function App() {
       setTabData({});
       setUnchecked(new Set());
       setCtxMenu(null);
+      setLogLimit(300);
       // 异步记一条最近打开，失败不阻塞主流程；成功后刷新最近列表，更新菜单和欢迎页
       invoke("add_recent", { path: summary.path })
         .then(loadRecent)
@@ -821,6 +878,22 @@ function App() {
       setCtxMenu(null);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // 重命名本地分支
+  async function doRenameBranch() {
+    if (!renameTarget || !renameValue.trim() || renameValue.trim() === renameTarget) {
+      setRenameTarget(null);
+      return;
+    }
+    try {
+      await invoke("rename_branch", { old: renameTarget, new: renameValue.trim() });
+      setRenameTarget(null);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+      setRenameTarget(null);
     }
   }
 
@@ -1187,8 +1260,8 @@ function App() {
           )}
         </div>
       ) : (
-        // 布局：左栏 | 工作区列（中栏+右栏在上，控制台在下，控制台不压左栏）
-        <div className="main">
+        // 布局：左栏 | 拖动条 | 工作区列（中栏+右栏在上，控制台在下）
+        <div className="main" style={{ gridTemplateColumns: `${leftW}px 5px 1fr` }}>
           {/* 左栏：文件树 + 工作区状态 */}
           <aside className="pane left">
             {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 */}
@@ -1224,8 +1297,12 @@ function App() {
                     <div
                       key={b.name}
                       className={`branch-tree-item ${b.isHead ? "current" : "clickable"}`}
-                      title={b.isHead ? "当前分支" : `点击切换到 ${b.name}`}
+                      title={b.isHead ? "当前分支（右键更多操作）" : `点击切换到 ${b.name}（右键更多操作）`}
                       onClick={() => !b.isHead && checkoutBranch(b.name)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setBranchCtx({ x: e.clientX, y: e.clientY, name: b.name });
+                      }}
                     >
                       <span className="branch-tree-name">⎇ {b.name}</span>
                       {!b.isHead && (
@@ -1393,10 +1470,32 @@ function App() {
             )}
           </aside>
 
+          {/* 左栏|工作区 拖动条（双击恢复默认 260px） */}
+          <div
+            className="divider-v"
+            title="拖动调整左栏宽度（双击恢复默认）"
+            onPointerDown={(e) => {
+              const start = leftW;
+              const startX = e.clientX;
+              startDrag(e, "col-resize", (ev) =>
+                setLeftW(clamp(start + ev.clientX - startX, 180, 480))
+              );
+            }}
+            onDoubleClick={() => setLeftW(260)}
+          />
+
           {/* 工作区列：上 = 中栏+右栏，下 = 控制台 */}
           <div className="workspace-col">
             {/* 文件/对比标签激活时右栏整栏隐藏，中栏工作区撑满（编辑器形态） */}
-            <div className={`workspace-row ${activeT?.kind !== "history" ? "no-right" : ""}`}>
+            <div
+              ref={workspaceRowRef}
+              className={`workspace-row ${activeT?.kind !== "history" ? "no-right" : ""}`}
+              style={
+                activeT?.kind !== "history"
+                  ? undefined
+                  : { gridTemplateColumns: `${1 - rightShare}fr 5px ${rightShare}fr` }
+              }
+            >
           {/* 中栏：标签页工作区——「提交历史」固定首页签，文件预览/对比开新标签 */}
           <section className="pane center">
             <div className="center-tabs">
@@ -1600,6 +1699,11 @@ function App() {
                   key={c.oid}
                   className={`commit-item ${selected === c.oid ? "selected" : ""}`}
                   onClick={() => setSelected(c.oid)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setSelected(c.oid);
+                    setCommitCtx({ x: e.clientX, y: e.clientY, oid: c.oid, summary: c.summary });
+                  }}
                 >
                   <div className="commit-row">
                     <CommitGraph
@@ -1626,10 +1730,33 @@ function App() {
                   </div>
                 </div>
               ))}
+              {/* 返回条数打满说明可能还有更早的历史 */}
+              {commits.length >= logLimit && (
+                <button className="load-more" onClick={() => setLogLimit((l) => l + 300)}>
+                  加载更多（再 300 条）
+                </button>
+              )}
             </div>
               </>
             )}
           </section>
+
+          {/* 中栏|右栏 拖动条（双击恢复默认占比）；右栏隐藏时不渲染 */}
+          {activeT?.kind === "history" && (
+            <div
+              className="divider-v"
+              title="拖动调整中/右栏比例（双击恢复默认）"
+              onPointerDown={(e) => {
+                const row = workspaceRowRef.current;
+                if (!row) return;
+                const rect = row.getBoundingClientRect();
+                startDrag(e, "col-resize", (ev) =>
+                  setRightShare(clamp((rect.right - ev.clientX) / rect.width, 0.25, 0.7))
+                );
+              }}
+              onDoubleClick={() => setRightShare(0.545)}
+            />
+          )}
 
           {/* 右栏：提交详情头 + 文件变更 + diff（仅提交历史标签激活时显示） */}
           {activeT?.kind === "history" && (
@@ -1686,9 +1813,43 @@ function App() {
           )}
             </div>
 
+            {/* 控制台|工作区 横向拖动条（仅展开时可拖，双击恢复默认 180px） */}
+            {consoleOpen && (
+              <div
+                className="divider-h"
+                title="拖动调整控制台高度（双击恢复默认）"
+                onPointerDown={(e) => {
+                  const start = consoleH;
+                  const startY = e.clientY;
+                  startDrag(e, "row-resize", (ev) =>
+                    setConsoleH(clamp(start - (ev.clientY - startY), 100, 400))
+                  );
+                }}
+                onDoubleClick={() => setConsoleH(180)}
+              />
+            )}
+
             {/* 控制台：压在工作区列底部（不压左栏），标题栏图标折叠/展开 */}
             <div className={`console-bar ${consoleOpen ? "open" : ""}`}>
-              <div className="console-head">
+              <div
+                className="console-head draggable"
+                title="拖动调整高度（折叠时向上拖直接展开），双击恢复默认"
+                onPointerDown={(e) => {
+                  // 点在按钮上不触发拖拽
+                  if ((e.target as HTMLElement).closest("button")) return;
+                  const start = consoleH;
+                  const startY = e.clientY;
+                  const wasOpen = consoleOpen;
+                  if (!wasOpen) setConsoleOpen(true); // 折叠时拖动直接展开
+                  startDrag(e, "row-resize", (ev) =>
+                    setConsoleH(clamp((wasOpen ? start : 180) - (ev.clientY - startY), 100, 400))
+                  );
+                }}
+                onDoubleClick={(e) => {
+                  if ((e.target as HTMLElement).closest("button")) return;
+                  setConsoleH(180);
+                }}
+              >
                 <span>控制台输出</span>
                 <div className="console-tools">
                   {consoleOpen && (
@@ -1710,7 +1871,9 @@ function App() {
                 </div>
               </div>
               {consoleOpen && (
-                <pre className="console-body">{consoleText || "(空)"}</pre>
+                <pre className="console-body" style={{ height: consoleH }}>
+                  {consoleText || "(空)"}
+                </pre>
               )}
             </div>
           </div>
@@ -1758,6 +1921,126 @@ function App() {
                 </button>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 提交历史右键菜单 */}
+      {commitCtx && (
+        <div
+          className="ctx-overlay"
+          onClick={() => setCommitCtx(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setCommitCtx(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{ left: commitCtx.x, top: commitCtx.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="recent-menu-item"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(commitCtx.oid);
+                } catch {
+                  setError("复制失败：剪贴板不可用");
+                }
+                setCommitCtx(null);
+              }}
+            >
+              ⧉ 复制完整 hash
+            </button>
+            <button
+              className="recent-menu-item"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(commitCtx.summary);
+                } catch {
+                  setError("复制失败：剪贴板不可用");
+                }
+                setCommitCtx(null);
+              }}
+            >
+              ⧉ 复制提交信息
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 分支树右键菜单 */}
+      {branchCtx && (
+        <div
+          className="ctx-overlay"
+          onClick={() => setBranchCtx(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setBranchCtx(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{ left: branchCtx.x, top: branchCtx.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="recent-menu-item"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(branchCtx.name);
+                } catch {
+                  setError("复制失败：剪贴板不可用");
+                }
+                setBranchCtx(null);
+              }}
+            >
+              ⧉ 复制分支名
+            </button>
+            <button
+              className="recent-menu-item"
+              onClick={() => {
+                setRenameTarget(branchCtx.name);
+                setRenameValue(branchCtx.name);
+                setBranchCtx(null);
+              }}
+            >
+              ✎ 重命名分支…
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 分支重命名弹窗 */}
+      {renameTarget && (
+        <div className="ctx-overlay dim" onClick={() => setRenameTarget(null)}>
+          <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title" style={{ color: "var(--accent)" }}>
+              重命名分支
+            </div>
+            <div className="confirm-path">{renameTarget}</div>
+            <input
+              className="rename-input"
+              autoFocus
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") doRenameBranch();
+                if (e.key === "Escape") setRenameTarget(null);
+              }}
+            />
+            <div className="confirm-actions">
+              <button
+                onClick={doRenameBranch}
+                disabled={!renameValue.trim() || renameValue.trim() === renameTarget}
+              >
+                重命名
+              </button>
+              <button className="ghost" onClick={() => setRenameTarget(null)}>
+                取消
+              </button>
+            </div>
           </div>
         </div>
       )}

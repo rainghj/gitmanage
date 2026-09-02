@@ -532,6 +532,20 @@ fn create_branch(
     })
 }
 
+/// 重命名本地分支。当前分支也允许（git 支持）；force=false 时与已有分支重名会报错。
+#[tauri::command]
+fn rename_branch(state: tauri::State<AppState>, old: String, new: String) -> Result<(), String> {
+    let new = new.trim().to_string();
+    if new.is_empty() {
+        return Err("分支名不能为空".to_string());
+    }
+    with_repo!(state, repo, {
+        let mut branch = repo.find_branch(&old, BranchType::Local).map_err(to_err)?;
+        // rename 返回重命名后的 Branch，丢弃即可
+        branch.rename(&new, false).map_err(to_err).map(|_| ())
+    })
+}
+
 #[tauri::command]
 fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Result<(), String> {
     with_repo!(state, repo, {
@@ -990,6 +1004,7 @@ pub fn run() {
             checkout_branch,
             create_branch,
             delete_branch,
+            rename_branch,
             stage_all,
             stage_files,
             discard_file_changes,

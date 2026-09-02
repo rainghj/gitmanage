@@ -373,11 +373,10 @@ button.link {
 
 /* ---------- 三栏 ---------- */
 
-/* 布局：左栏 | 工作区列（内容区 + 底部控制台） */
+/* 布局：左栏 | 拖动条 | 工作区列（列宽由内联 style 控制，支持拖动） */
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 260px 1fr;
   min-height: 0;
 }
 
@@ -391,19 +390,75 @@ button.link {
 .workspace-row {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 1.2fr;
   min-height: 0;
 }
 
 /* 文件/对比标签激活时：右栏不渲染，中栏工作区撑满（编辑器形态） */
 .workspace-row.no-right {
-  grid-template-columns: 1fr;
+  grid-template-columns: 1fr !important;
+}
+
+/* 拖动分割条：5px 命中区 + 1px 可见中线，hover 整条高亮 */
+.divider-v {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.divider-v::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.divider-v:hover {
+  background: rgba(55, 148, 255, 0.18);
+}
+
+.divider-v:hover::after {
+  background: var(--accent-2);
+}
+
+.divider-h {
+  position: relative;
+  cursor: row-resize;
+  touch-action: none;
+  height: 5px;
+  flex-shrink: 0;
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.divider-h::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+.divider-h:hover {
+  background: rgba(55, 148, 255, 0.18);
+}
+
+.divider-h:hover::after {
+  background: var(--accent-2);
 }
 
 .pane {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* 防止 grid 子项 min-width:auto 被内容撑爆轨道、盖住拖动条 */
+  min-width: 0;
   border-right: 1px solid var(--border);
   background: var(--bg);
 }
@@ -1014,6 +1069,41 @@ button.ghost.small {
   filter: none;
 }
 
+/* 分支重命名输入框 */
+.rename-input {
+  margin-top: 10px;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 13px;
+  outline: none;
+}
+
+.rename-input:focus {
+  border-color: var(--accent-2);
+}
+
+/* 提交历史底部「加载更多」 */
+.load-more {
+  display: block;
+  width: calc(100% - 20px);
+  margin: 8px 10px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 6px 0;
+  font-size: 12px;
+}
+
+.load-more:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* ---------- 提交列表 ---------- */
 
 .commit-list {
@@ -1380,6 +1470,17 @@ button.ghost.small {
 
 .console-bar.open .console-head {
   border-bottom: 1px solid var(--border);
+}
+
+/* 控制台标题栏可拖动调高度 */
+.console-head.draggable {
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.console-head.draggable button {
+  cursor: pointer;
 }
 
 .console-body {
