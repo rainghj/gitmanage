@@ -1500,6 +1500,348 @@ button.ghost.small {
   word-break: break-all;
 }
 
+/* ---------- 合并冲突（左栏「冲突」页 + 三路合并面板） ---------- */
+
+/* 左栏顶部「冲突」tab：有冲突时红色提醒（含未激活态） */
+.left-tab.alert {
+  color: var(--red);
+}
+
+/* 冲突文件列表 */
+.conflict-tree {
+  display: flex;
+  flex-direction: column;
+}
+
+.conflict-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--red);
+  border-bottom: 1px solid var(--border);
+}
+
+.danger-text {
+  color: var(--red) !important;
+}
+
+.conflict-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conflict-type {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  background: var(--panel-2);
+}
+
+.st-conflict {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* ---------- 三路合并面板（MergePanel） ---------- */
+
+.merge-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.merge-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.merge-path {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+
+.merge-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.merge-binary-hint {
+  font-size: 12px;
+  color: var(--red);
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* 三列表头 */
+.m3-col-heads {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+
+.m3-col-heads span {
+  padding: 4px 10px;
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.m3-col-heads span:last-child {
+  border-right: none;
+}
+
+.m3-grid {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* 每行 = 本地 / 结果 / 远程 三列 */
+.m3-grid .m3-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  min-width: 0;
+}
+
+.m3-cell {
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  border-right: 1px solid var(--border);
+  color: var(--text);
+  min-height: 18px;
+  min-width: 0;
+}
+
+.m3-cell:last-child {
+  border-right: none;
+}
+
+/* cell 内的文本占满剩余空间，按钮固定 24px；文本过长 ellipsis 截断 */
+.m3-cell-text {
+  flex: 1;
+  padding: 0 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  min-width: 0;
+}
+
+/* 上下文行：三侧一致，弱化 */
+.m3-cell.ctx .m3-cell-text {
+  color: var(--text-dim);
+}
+
+/* 行级采纳按钮：放在中间「解决结果」列的两侧边缘 —— 用户在中间结果列旁点按钮
+   决定采纳本地还是远程（VS Code 3-way 风格，操作集中在结果列） */
+.m3-adopt {
+  flex: 0 0 24px;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 18px;
+  user-select: none;
+  padding: 0;
+}
+.m3-cell.result .m3-adopt.ours {
+  border-right: 1px solid var(--border); /* 与结果文本分隔 */
+}
+.m3-cell.result .m3-adopt.theirs {
+  border-left: 1px solid var(--border);
+}
+.m3-adopt:hover {
+  background: var(--panel-2);
+  color: var(--accent-2);
+}
+.m3-adopt:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* 仅本地/仅远程的行：整行强调底色，便于一眼定位差异 */
+.m3-grid .ours-only .m3-cell.a,
+.m3-grid .ours-only .m3-cell.result {
+  background: rgba(78, 201, 176, 0.12); /* 本地侧：teal 淡底 */
+}
+
+.m3-grid .theirs-only .m3-cell.b,
+.m3-grid .theirs-only .m3-cell.result {
+  background: rgba(87, 156, 214, 0.12); /* 远程侧：蓝淡底 */
+}
+
+/* 行已被采纳的那一格（侧按钮高亮）；result 列在行级采纳后用更深的强调色 */
+.m3-cell.a .m3-adopt:active,
+.m3-cell.b .m3-adopt:active {
+  background: rgba(78, 201, 176, 0.18);
+}
+
+.m3-cell.result.adopted {
+  background: rgba(78, 201, 176, 0.18);
+}
+
+/* ⊕ 占位：Accept Both 模式下，result 列不显示文本，只标记该行所在块已双侧采纳 */
+.m3-void {
+  color: var(--border);
+  user-select: none;
+}
+.m3-block-bar {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr; /* 与下方 m3-row 三列对齐：左/中/右各占一格 */
+  align-items: center;
+  padding: 2px 10px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+/* 块头三列单元（左/中/右），与下方 m3-cell 列宽对齐 */
+.m3-block-side {
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  min-width: 0;
+}
+.m3-block-side.left {
+  justify-content: flex-start;
+}
+.m3-block-side.right {
+  justify-content: flex-end;
+}
+
+.m3-block-mid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 块级采纳按钮：大字符箭头让"整块采纳"动作很醒目（对应 IDEA 的 >>> <<<） */
+.m3-block-adopt {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--accent);
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+.m3-block-adopt:hover {
+  background: var(--panel);
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+  filter: none;
+}
+.m3-block-adopt:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.m3-block-adopt.done {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.m3-block-bar.done {
+  background: rgba(78, 201, 176, 0.18);
+}
+
+.m3-block-no {
+  color: var(--yellow);
+  font-family: inherit;
+}
+
+.m3-block-state {
+  color: var(--text-dim);
+}
+
+.m3-block-state.pending {
+  color: var(--red);
+}
+
+.m3-void {
+  color: var(--border);
+  user-select: none;
+}
+
+/* 逐块模式 / 整体模式的说明与操作行 */
+.merge-whole-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.merge-whole-actions .m3-void {
+  color: var(--text-dim);
+}
+
+.m3-row.whole .m3-cell {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.merge-tip {
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* 编辑模式下（file tab）修改冲突文件后再回到冲突页时，提示栏可复用 */
+.merge-file-hint {
+  padding: 6px 10px;
+  color: var(--yellow);
+  font-size: 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.merge-file-hint.err {
+  color: var(--red);
+}
+
 /* ---------- 滚动条 ---------- */
 
 ::-webkit-scrollbar {

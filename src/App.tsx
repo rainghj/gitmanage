@@ -19,6 +19,8 @@ import cpp from "highlight.js/lib/languages/cpp";
 import java from "highlight.js/lib/languages/java";
 import sql from "highlight.js/lib/languages/sql";
 import "highlight.js/styles/vs2015.css"; // VS Code 深色风，贴合整体蓝灰调
+import { alignLines, applyNonConflicting, buildResultText, parseConflictText } from "./conflictText";
+import type { M3Seg, Picks } from "./conflictText";
 import "./App.css";
 
 hljs.registerLanguage("rust", rust);
@@ -164,6 +166,20 @@ interface StashEntry {
   index: number;
   message: string;
   oid: string;
+}
+
+interface ConflictFile {
+  path: string;
+  hasBase: boolean;
+  hasOurs: boolean;
+  hasTheirs: boolean;
+}
+
+interface ConflictSides {
+  path: string;
+  base: string | null;
+  ours: string | null;
+  theirs: string | null;
 }
 
 // ---------- 文件树工具：平铺路径 → 嵌套树 ----------
@@ -380,6 +396,579 @@ function DiffView({ text, hint = "选择左侧提交查看改动" }: { text: str
   );
 }
 
+// ---------- 三路合并面板（解决 pull/merge 冲突） ----------
+//
+// 冲突标记文本的解析/对齐/拼装逻辑在 src/conflictText.ts（纯函数，可单测）：
+// 磁盘文件带 <<<<<<< / ======= / >>>>>>> 标记 → 切成「普通段 + 冲突块」，
+// 块内行对齐让本地/远程两列同行对比；块是整块替换的原子单位，
+// 全部块选择完才允许写回 + 暂存（git add = 标记已解决）。
+function MergePanel({
+  path,
+  onOpenFile,
+  onResolved,
+  onAbort,
+}: {
+  path: string;
+  onOpenFile: (p: string) => void;
+  onResolved: () => void;
+  onAbort: () => void;
+}) {
+  // sides：undefined=加载中 / null=后端读取失败；disk：null=磁盘读取失败（二进制等）
+  const [sides, setSides] = useState<ConflictSides | null | undefined>(undefined);
+  const [disk, setDisk] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  // picks：行级选择 + Accept Both。每个冲突块的 row 数在 segs 解析后才知道，先初始化为空
+  const [picks, setPicks] = useState<Picks>({});
+  // 整体模式（磁盘无冲突标记，如单侧冲突 added/deleted）下的选择："ours"|"theirs"|null
+  const [wholePick, setWholePick] = useState<"ours" | "theirs" | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let dead = false;
+    setError("");
+    setSides(undefined);
+    setDisk(null);
+    setPicks({});
+    setWholePick(null);
+    invoke<ConflictSides | null>("get_conflict_sides", { path })
+      .then((s) => {
+        if (!dead) setSides(s);
+      })
+      .catch((e) => {
+        if (!dead) {
+          setError(String(e));
+          setSides(null);
+        }
+      });
+    // 磁盘文件可能读不到（二进制含 NUL 会被后端拒绝）——失败不致命，
+    // sides 已带两侧内容，走「整体模式」仍可整侧采用；二进制面板另有专门提示
+    invoke<string>("read_file_content", { path })
+      .then((d) => {
+        if (!dead) setDisk(d);
+      })
+      .catch(() => {
+        if (!dead) setDisk(null);
+      });
+    return () => {
+      dead = true;
+    };
+  }, [path]);
+
+  // 根据磁盘文本解析段结构；失败（无有效标记文本）视为整体模式
+  const parsed = useMemo(() => {
+    if (disk === null) return null;
+    try {
+      const { eol, segs } = parseConflictText(disk);
+      const blocks = segs.filter((s) => s.kind === "conflict") as Extract<
+        M3Seg,
+        { kind: "conflict" }
+      >[];
+      return { eol, segs, blocks, whole: blocks.length === 0, hasMarkers: disk.includes("<<<<<<<") };
+    } catch {
+      return null;
+    }
+  }, [disk]);
+
+  // 冲突块数 + 行级采纳进度
+  let totalBlocks = 0;
+  let totalRows = 0;
+  let resolvedRows = 0;
+  if (parsed) {
+    for (const b of parsed.blocks) {
+      totalBlocks++;
+      const n = alignLines(b.ours, b.theirs).length;
+      totalRows += n;
+      const pick = picks[b.id];
+      if (pick) {
+        resolvedRows += pick.both ? n : pick.sides.filter((s) => s !== null).length;
+      }
+    }
+  }
+  const allResolved = totalRows > 0 && resolvedRows === totalRows;
+  // 两侧都没有内容（后端 blob 读不出/二进制）：只能走编辑器手动处理
+  const fileBinary =
+    sides !== null && sides !== undefined && sides.ours === null && sides.theirs === null;
+
+  // 行级采纳：把某块第 rowIdx 行设为 ours/theirs；both 状态会被关掉（行级粒度优先）
+  const pickRow = (blockId: number, rowIdx: number, side: "ours" | "theirs") =>
+    setPicks((m) => {
+      const cur = m[blockId] ?? { sides: [], both: false };
+      const sides = cur.sides.slice();
+      sides[rowIdx] = side;
+      return { ...m, [blockId]: { sides, both: false } };
+    });
+
+  // 整块快速采纳：把该块所有行都设为 ours/theirs（覆盖既有行级选择）
+  const pickBlock = (blockId: number, side: "ours" | "theirs") =>
+    setPicks((m) => {
+      const cur = m[blockId];
+      if (!cur) return m;
+      return { ...m, [blockId]: { sides: cur.sides.map(() => side), both: false } };
+    });
+
+  // Accept Both：该块 ours + theirs 全部按顺序纳入结果（行级忽略）
+  const pickBlockBoth = (blockId: number) =>
+    setPicks((m) => {
+      const cur = m[blockId];
+      if (!cur) return m;
+      return { ...m, [blockId]: { sides: cur.sides, both: true } };
+    });
+
+  // 把所有冲突块都整块采纳同一侧
+  const pickAll = (side: "ours" | "theirs") => {
+    if (!parsed) return;
+    setPicks((m) => {
+      const next: Picks = {};
+      for (const seg of parsed.segs) {
+        if (seg.kind !== "conflict") continue;
+        const cur = m[seg.id];
+        next[seg.id] = cur
+          ? { sides: cur.sides.map(() => side), both: false }
+          : { sides: [], both: true /* 下方补齐 */ };
+      }
+      return next;
+    });
+  };
+
+  // 所有冲突块都 Accept Both（适合"两边各加一段"场景）
+  const pickAllBoth = () => {
+    if (!parsed) return;
+    setPicks((m) => {
+      const next: Picks = {};
+      for (const seg of parsed.segs) {
+        if (seg.kind !== "conflict") continue;
+        const cur = m[seg.id];
+        next[seg.id] = { sides: cur?.sides ?? [], both: true };
+      }
+      return next;
+    });
+  };
+
+  // 「应用无冲突的更改」：自动采纳两侧不冲突的行（两侧相同 / 单侧独立改动），
+  // 真冲突（两侧在同一位置各改不同内容）保持未选，留给人工决策
+  const applyNonConf = (direction: "both" | "ours" | "theirs") => {
+    if (!parsed) return;
+    setPicks((m) => applyNonConflicting(parsed.segs, m, direction));
+  };
+
+  // 块级版本：只对指定冲突块应用无冲突更改
+  const applyBlockNonConf = (blockId: number) => {
+    if (!parsed) return;
+    setPicks((m) => applyNonConflicting(parsed.segs, m, "both", blockId));
+  };
+
+  // 组装最终内容并写回 + 暂存（git add = 标记已解决）
+  async function resolveWith(content: string) {
+    setBusy(true);
+    try {
+      await invoke("write_file_content", { path, content });
+      await invoke("stage_files", { paths: [path] });
+      onResolved();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 逐块模式：按各块选择拼出最终文本（模块版会校验全部块都已选择）
+  function buildResult(): string | null {
+    if (!parsed || !allResolved) return null;
+    return buildResultText(parsed.segs, picks, parsed.eol);
+  }
+
+  const doResolve = () => {
+    if (fileBinary) return;
+    // parsed === null（磁盘读失败/无可解析文本）或磁盘无冲突块 → 整体模式
+    const whole = parsed === null || parsed.whole;
+    if (whole) {
+      if (wholePick) {
+        const content = wholePick === "ours" ? sides?.ours : sides?.theirs;
+        if (content === undefined || content === null) {
+          setError("所选一侧不存在（该侧没有此文件），请改选另一侧");
+          return;
+        }
+        resolveWith(content);
+        return;
+      }
+      if (disk !== null && (parsed === null || !parsed.hasMarkers)) {
+        if (!confirm("文件不包含冲突标记（可能已手动解决）。\n将当前工作区内容标记为已解决并暂存？")) return;
+        resolveWith(disk);
+        return;
+      }
+      if (disk === null) {
+        setError("无法读取工作区文件（二进制或已被删除）。请先点击「采用本地/远程」选择一侧，或用编辑器手动处理");
+        return;
+      }
+      setError("请先点击「采用本地」或「采用远程」选择一侧");
+      return;
+    }
+    const text = buildResult();
+    if (text !== null) resolveWith(text);
+  };
+
+  // 把显示行里的 \r 剥掉（CRLF 文件按行显示更干净，写回时统一用检测到的 eol）
+  const clean = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
+
+  // 三列内容渲染数据：按段生成展示行流
+  const rows = useMemo(() => {
+    if (!parsed || parsed.whole) return null;
+    type Row =
+      | { t: "ctx"; line: string }
+      | { t: "bar"; id: number }
+      | { t: "pair"; id: number; rowIdx: number; a: string | null; b: string | null; common: boolean };
+    const out: Row[] = [];
+    for (const seg of parsed.segs) {
+      if (seg.kind === "text") {
+        for (const line of seg.lines) out.push({ t: "ctx", line });
+      } else {
+        out.push({ t: "bar", id: seg.id });
+        const aligned = alignLines(seg.ours, seg.theirs);
+        aligned.forEach(([ai, bi], rowIdx) => {
+          out.push({
+            t: "pair",
+            id: seg.id,
+            rowIdx,
+            a: ai !== null ? seg.ours[ai] : null,
+            b: bi !== null ? seg.theirs[bi] : null,
+            common: ai !== null && bi !== null,
+          });
+        });
+      }
+    }
+    return out;
+  }, [parsed]);
+
+  // picks 按冲突块的"对齐后行数"初始化；用户已采纳的行/Accept Both 选择会保留
+  useEffect(() => {
+    if (!parsed) return;
+    setPicks((prev) => {
+      const next: Picks = {};
+      for (const seg of parsed.segs) {
+        if (seg.kind !== "conflict") continue;
+        const rowCount = alignLines(seg.ours, seg.theirs).length;
+        const old = prev[seg.id];
+        next[seg.id] =
+          old && old.sides.length === rowCount ? old : { sides: new Array(rowCount).fill(null), both: false };
+      }
+      return next;
+    });
+  }, [parsed]);
+
+  // 每个冲突块的对齐后行数（避免在 JSX 内反复 alignLines）
+  const blockRowCounts = useMemo(() => {
+    const m: Record<number, number> = {};
+    if (!parsed) return m;
+    for (const seg of parsed.segs) {
+      if (seg.kind === "conflict") m[seg.id] = alignLines(seg.ours, seg.theirs).length;
+    }
+    return m;
+  }, [parsed]);
+
+  if (sides === undefined) return <div className="empty-hint">加载中…</div>;
+  if (sides === null) {
+    return (
+      <div className="empty-hint" style={{ color: "var(--red)" }}>
+        {error || "读取冲突信息失败"}
+      </div>
+    );
+  }
+
+  // parsed===null（磁盘读失败）与磁盘无冲突块都走「整体模式」：整侧采用或靠编辑器
+  const whole = parsed === null || parsed.whole;
+  const errFlash =
+    error && sides !== null ? (
+      <div className="merge-file-hint err">⚠ {error}</div>
+    ) : null;
+
+  if (fileBinary) {
+    return (
+      <div className="merge-panel">
+        <div className="merge-toolbar">
+          <span className="merge-path" title={path}>{path}</span>
+          <span className="merge-binary-hint">二进制文件，无法三路对比</span>
+          <span className="spacer" />
+          <button className="ghost small" onClick={() => onOpenFile(path)}>在编辑器中处理…</button>
+          <button className="ghost small" disabled={busy} onClick={onAbort}>放弃合并…</button>
+        </div>
+        <div className="empty-hint">请在编辑器中手动处理该文件后，回到「冲突」页点击「标记已解决」。</div>
+      </div>
+    );
+  }
+
+  if (whole) {
+    // 整体模式：无冲突标记（单侧新增/删除冲突等），直接选择一侧作为解决结果
+    const oursText = sides.ours;
+    const theirsText = sides.theirs;
+    const resultText =
+      wholePick === "ours" ? oursText : wholePick === "theirs" ? theirsText : disk;
+    const hasBoth = oursText !== null && theirsText !== null;
+    const note = !parsed
+      ? hasBoth
+        ? "工作区内容无法预览（二进制或已删除）——可整侧采用本地/远程"
+        : "单侧冲突：某一侧删除了此文件"
+      : hasBoth
+        ? "两版本都改动此文件（无冲突标记），请选择保留哪个"
+        : "单侧冲突：某一侧删除了此文件";
+    return (
+      <div className="merge-panel">
+        <div className="merge-toolbar">
+          <span className="merge-path" title={path}>{path}</span>
+          <span className="merge-note">{note}</span>
+          <span className="spacer" />
+          <button className="ghost small" onClick={() => onOpenFile(path)}>在编辑器中手动处理…</button>
+          <button className="ghost small" disabled={busy} onClick={onAbort}>放弃合并…</button>
+          <button
+            disabled={busy}
+            title="把选择/当前内容写回并暂存（标记已解决）"
+            onClick={doResolve}
+          >
+            标记已解决
+          </button>
+        </div>
+        {errFlash}
+        <div className="m3-col-heads">
+          <span>本地（HEAD）</span>
+          <span>解决结果</span>
+          <span>远程（合入方）</span>
+        </div>
+        <div className="m3-grid">
+          <div className="m3-row whole">
+            <div className="m3-cell">{oursText !== null ? clean(oursText) : "（此侧没有该文件）"}</div>
+            <div className="m3-cell result">
+              {resultText !== null && resultText !== undefined
+                ? clean(resultText)
+                : wholePick
+                  ? "（该侧无内容）"
+                  : "选择一侧后显示结果"}
+            </div>
+            <div className="m3-cell">{theirsText !== null ? clean(theirsText) : "（此侧没有该文件）"}</div>
+          </div>
+        </div>
+        <div className="merge-whole-actions">
+          <button className="ghost" disabled={oursText === null || busy} onClick={() => setWholePick("ours")}>
+            ← 采用本地
+          </button>
+          <button className="ghost" disabled={theirsText === null || busy} onClick={() => setWholePick("theirs")}>
+            采用远程 →
+          </button>
+          <span className="merge-note">（若已在编辑器中手动解决过，可直接点「标记已解决」）</span>
+        </div>
+      </div>
+    );
+  }
+
+  // 逐块模式
+  // 单行采纳结果：null=未采纳 / "ours"/"theirs"=采纳了某侧 / "both"=整块 Accept Both
+  const rowSide = (id: number, rowIdx: number): "ours" | "theirs" | "both" | null => {
+    const pick = picks[id];
+    if (!pick) return null;
+    if (pick.both) return "both";
+    return pick.sides[rowIdx] ?? null;
+  };
+  const resultTextFor = (row: { t: "pair"; a: string | null; b: string | null }, side: "ours" | "theirs" | "both" | null): string | null => {
+    if (side === "ours") return row.a;
+    if (side === "theirs") return row.b;
+    return null; // null 或 both → 不显示文本（both 的预览另作占位）
+  };
+
+  // 行数护栏：冲突文件太大时逐行三列渲染会拖垮 UI，引导去编辑器手动处理
+  if (rows && rows.length > 8000) {
+    return (
+      <div className="merge-panel">
+        <div className="merge-toolbar">
+          <span className="merge-path" title={path}>{path}</span>
+          <span className="merge-note">共 {totalBlocks} 处冲突（文件过大，共 {rows.length} 显示行）</span>
+          <span className="spacer" />
+          <button className="ghost small" onClick={() => onOpenFile(path)}>在编辑器中手动处理…</button>
+          <button className="ghost small" disabled={busy} onClick={onAbort}>放弃合并…</button>
+        </div>
+        <div className="empty-hint">
+          该文件超过逐行渲染上限。请在编辑器中删掉 &lt;&lt;&lt;&lt;&lt;&lt;&lt; / ======= / &gt;&gt;&gt;&gt;&gt;&gt;&gt;
+          保留需要的内容并保存，然后回到「冲突」页点击「标记已解决」。
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="merge-panel">
+      <div className="merge-toolbar">
+        <span className="merge-path" title={path}>{path}</span>
+        <span className="merge-note">
+          共 {totalBlocks} 处冲突 · 已采纳 {resolvedRows}/{totalRows} 行
+        </span>
+        <span className="spacer" />
+        <button
+          className="ghost small apply-nonconf"
+          title="自动采纳不冲突的行：两侧内容相同的行、以及只有一侧有的独立改动；真冲突（两侧在同一位置各改了不同内容）保持未选"
+          disabled={busy}
+          onClick={() => applyNonConf("both")}
+        >
+          ⇥ 应用无冲突
+        </button>
+        <button
+          className="ghost small"
+          title="只应用左侧（本地）的无冲突改动"
+          disabled={busy}
+          onClick={() => applyNonConf("ours")}
+        >
+          应用左侧无冲突
+        </button>
+        <button
+          className="ghost small"
+          title="只应用右侧（远程）的无冲突改动"
+          disabled={busy}
+          onClick={() => applyNonConf("theirs")}
+        >
+          应用右侧无冲突
+        </button>
+        <button className="ghost small" title="所有冲突块都整块采纳本地（HEAD），箭头指向中间结果列" disabled={busy} onClick={() => pickAll("ours")}>全部采用本地 →</button>
+        <button className="ghost small" title="所有冲突块都整块采纳远程（合入方），箭头指向中间结果列" disabled={busy} onClick={() => pickAll("theirs")}>← 全部采用远程</button>
+        <button className="ghost small" title="所有冲突块都「Accept Both」——ours 与 theirs 都纳入结果" disabled={busy} onClick={pickAllBoth}>全部接受两侧</button>
+        <button className="ghost small" onClick={() => onOpenFile(path)}>在编辑器中手动处理…</button>
+        <button className="ghost small" disabled={busy} onClick={onAbort}>放弃合并…</button>
+        <button
+          disabled={busy || !allResolved}
+          title={allResolved ? "写回合并结果并暂存（标记已解决）" : `还有 ${totalRows - resolvedRows} 行待采纳`}
+          onClick={doResolve}
+        >
+          标记已解决
+        </button>
+      </div>
+      {errFlash}
+      <div className="m3-col-heads">
+        <span>本地（HEAD）</span>
+        <span>解决结果</span>
+        <span>远程（合入方）</span>
+      </div>
+      <div className="m3-grid">
+        {rows!.map((row, idx) => {
+          if (row.t === "ctx") {
+            return (
+              <div key={idx} className="m3-row">
+                <div className="m3-cell ctx" title="上下文（三侧一致）"><span className="m3-cell-text">{clean(row.line)}</span></div>
+                <div className="m3-cell ctx"><span className="m3-cell-text">{clean(row.line)}</span></div>
+                <div className="m3-cell ctx"><span className="m3-cell-text">{clean(row.line)}</span></div>
+              </div>
+            );
+          }
+          if (row.t === "bar") {
+            const pick = picks[row.id];
+            const both = !!pick?.both;
+            const blockRows = blockRowCounts[row.id] ?? 0;
+            const resolvedRowsInBlock = pick
+              ? (pick.both ? blockRows : pick.sides.filter((s) => s !== null).length)
+              : 0;
+            return (
+              <div key={idx} className={`m3-block-bar ${pick ? "done" : ""}`}>
+                {/* 左列上方的「>>>」块级采纳本地按钮 —— 对齐 IDEA 的位置 */}
+                <div className="m3-block-side left">
+                  <button
+                    className={`m3-block-adopt ${pick && pick.sides.length > 0 && pick.sides.every((s) => s === "ours") ? "done" : ""}`}
+                    disabled={busy}
+                    title="整块采纳本地（HEAD）"
+                    onClick={() => pickBlock(row.id, "ours")}
+                  >
+                    整块本地 →
+                  </button>
+                </div>
+                {/* 中间：冲突编号 + 状态 + Accept Both */}
+                <div className="m3-block-mid">
+                  <span className="m3-block-no">冲突 {row.id + 1}/{totalBlocks}</span>
+                  {both ? (
+                    <span className="m3-block-state">已采用：两侧都留</span>
+                  ) : pick && resolvedRowsInBlock > 0 ? (
+                    <span className="m3-block-state">已采纳 {resolvedRowsInBlock}/{blockRows} 行</span>
+                  ) : (
+                    <span className="m3-block-state pending">未解决</span>
+                  )}
+                  <button
+                    className={`m3-block-adopt ${both ? "done" : ""}`}
+                    disabled={busy || both}
+                    title="Accept Both：ours 与 theirs 全部按顺序纳入结果"
+                    onClick={() => pickBlockBoth(row.id)}
+                  >
+                    两侧都留
+                  </button>
+                  <button
+                    className="m3-block-adopt"
+                    disabled={busy || both}
+                    title="只对本块应用无冲突的更改（两侧相同 / 单侧独立改动自动采纳，真冲突保留）"
+                    onClick={() => applyBlockNonConf(row.id)}
+                  >
+                    应用无冲突
+                  </button>
+                </div>
+                {/* 右列上方的「<<<」块级采纳远程按钮 —— 对齐 IDEA 的位置 */}
+                <div className="m3-block-side right">
+                  <button
+                    className={`m3-block-adopt ${pick && pick.sides.length > 0 && pick.sides.every((s) => s === "theirs") ? "done" : ""}`}
+                    disabled={busy}
+                    title="整块采纳远程（合入方）"
+                    onClick={() => pickBlock(row.id, "theirs")}
+                  >
+                    ← 整块远程
+                  </button>
+                </div>
+              </div>
+            );
+          }
+          const side = rowSide(row.id, row.rowIdx);
+          const rText = resultTextFor(row, side);
+          const cls = row.common ? "m3-row" : row.a !== null ? "m3-row ours-only" : "m3-row theirs-only";
+          // 该 row 是否有任何侧内容：两侧都无内容时隐藏整行的采纳按钮（无意义）
+          const hasAnyContent = row.a !== null || row.b !== null;
+          return (
+            <div key={idx} className={cls}>
+              <div className={`m3-cell a${row.common ? " common" : ""}`}>
+                <span className="m3-cell-text">{row.a !== null ? clean(row.a) : ""}</span>
+              </div>
+              <div className={`m3-cell result${side ? " adopted" : ""}`}>
+                {/* 中间结果列：左侧 → 按钮采纳本地、右侧 ← 按钮采纳远程，操作集中在结果列 */}
+                {hasAnyContent && (
+                  <button
+                    className="m3-adopt ours"
+                    disabled={busy || row.a === null}
+                    title="采纳本地这一行（→ 指向结果列）"
+                    onClick={() => pickRow(row.id, row.rowIdx, "ours")}
+                  >
+                    →
+                  </button>
+                )}
+                <span className="m3-cell-text">
+                  {side === "both"
+                    ? <span className="m3-void">⊕</span>
+                    : rText !== null
+                      ? clean(rText)
+                      : <span className="m3-void">·</span>}
+                </span>
+                {hasAnyContent && (
+                  <button
+                    className="m3-adopt theirs"
+                    disabled={busy || row.b === null}
+                    title="采纳远程这一行（← 指向结果列）"
+                    onClick={() => pickRow(row.id, row.rowIdx, "theirs")}
+                  >
+                    ←
+                  </button>
+                )}
+              </div>
+              <div className={`m3-cell b${row.common ? " common" : ""}`}>
+                <span className="m3-cell-text">{row.b !== null ? clean(row.b) : ""}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="merge-tip">
+        提示：行末 ←/→ 箭头采纳该行；冲突块头有「整块本地/远程/两侧都留」快捷操作；
+        <span style={{ color: "var(--text-dim)" }}> ⊕ 表示该行所在块已 Accept Both</span>
+      </div>
+    </div>
+  );
+}
+
 // ---------- 布局拖拽分割 ----------
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -426,7 +1015,8 @@ function startDrag(e: React.PointerEvent<HTMLElement>, cursor: string, onMove: (
 type CenterTab =
   | { kind: "history" }
   | { kind: "file"; path: string }
-  | { kind: "wdiff"; path: string };
+  | { kind: "wdiff"; path: string }
+  | { kind: "merge"; path: string };
 
 function tabKey(t: CenterTab): string {
   return t.kind === "history" ? "history" : `${t.kind}:${t.path}`;
@@ -435,7 +1025,9 @@ function tabKey(t: CenterTab): string {
 function tabLabel(t: CenterTab): string {
   if (t.kind === "history") return "提交历史";
   const base = t.path.split("/").pop() ?? t.path;
-  return t.kind === "wdiff" ? `对比 ${base}` : base;
+  if (t.kind === "wdiff") return `对比 ${base}`;
+  if (t.kind === "merge") return `解决冲突 ${base}`;
+  return base;
 }
 
 // ---------- 状态徽标 ----------
@@ -493,13 +1085,15 @@ function App() {
   const [filterQuery, setFilterQuery] = useState("");
   const [recent, setRecent] = useState<RecentEntry[]>([]);
   const [stashes, setStashes] = useState<StashEntry[]>([]);
+  // 合并冲突文件列表（merge 进行中才有；无冲突时空数组）
+  const [conflicts, setConflicts] = useState<ConflictFile[]>([]);
   const [consoleText, setConsoleText] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [opBusy, setOpBusy] = useState<string | null>(null); // 当前正在执行的远程操作
   const [pathMenuOpen, setPathMenuOpen] = useState(false); // 路径显示框（已开仓库时）点击弹出的统一菜单
   const [recentMenuIndex, setRecentMenuIndex] = useState(0); // 菜单里键盘高亮的那一项
   const pathMenuRef = useRef<HTMLDivElement>(null); // 包住显示框 + 菜单的容器
-  const [leftTab, setLeftTab] = useState<"branches" | "files">("branches"); // 左栏顶部 tab：分支树 / 文件树
+  const [leftTab, setLeftTab] = useState<"branches" | "files" | "conflicts">("branches"); // 左栏顶部 tab：分支树 / 文件树 / 冲突
   const [remoteUrlOpen, setRemoteUrlOpen] = useState(false); // 中栏过滤条上的「设置远程」输入行
   const [remoteUrl, setRemoteUrl] = useState("");
   // [ahead, behind]：待 push / 待 pull 条数；null = 无上游（纯本地仓库）不显示角标
@@ -539,7 +1133,7 @@ function App() {
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st, s, ab, sk] = await Promise.all([
+      const [bs, log, t, st, s, ab, sk, cf] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: logLimit,
@@ -551,6 +1145,7 @@ function App() {
         invoke<StashEntry[]>("stash_list"),
         invoke<[number, number] | null>("get_ahead_behind"),
         invoke<string[]>("get_skip_list"),
+        invoke<ConflictFile[]>("get_conflicts"),
       ]);
       setBranches(bs);
       setCommits(log);
@@ -559,6 +1154,7 @@ function App() {
       setStashes(s);
       setSyncCounts(ab);
       setSkipList(sk);
+      setConflicts(cf);
       // 已打开的文件/对比标签内容可能已过时，清空缓存让激活标签重拉
       setTabData({});
     } catch (e) {
@@ -568,7 +1164,7 @@ function App() {
 
   // ---------- 中栏标签页 ----------
 
-  function openCenterTab(kind: "file" | "wdiff", path: string) {
+  function openCenterTab(kind: "file" | "wdiff" | "merge", path: string) {
     // 焦点转到中栏标签页：取消提交历史的选中，右栏回到空提示，避免"右边还显示着旧提交"的困惑
     setSelected(null);
     const key = `${kind}:${path}`;
@@ -628,9 +1224,10 @@ function App() {
     });
   }
 
-  // 激活的文件/对比标签按需加载内容（结果缓存进 tabData，refresh 时清空重拉）
+  // 激活的文件/对比标签按需加载内容（结果缓存进 tabData，refresh 时清空重拉）。
+  // merge 标签内容由 MergePanel 自管（需要结构化 sides + 逐块选择状态），不走 tabData
   useEffect(() => {
-    if (!activeT || activeT.kind === "history") return;
+    if (!activeT || activeT.kind === "history" || activeT.kind === "merge") return;
     if (tabData[activeKey] !== undefined) return;
     let dead = false;
     invoke<string>(activeT.kind === "file" ? "read_file_content" : "get_workdir_diff", {
@@ -678,6 +1275,7 @@ function App() {
       setActiveTab(0);
       setTabData({});
       setUnchecked(new Set());
+      setConflicts([]);
       setCtxMenu(null);
       setLogLimit(300);
       // 异步记一条最近打开，失败不阻塞主流程；成功后刷新最近列表，更新菜单和欢迎页
@@ -716,12 +1314,13 @@ function App() {
       setError(String(e));
       return; // 释放失败别继续，否则前端状态和后端会脱钩
     }
-    setRepo(null);
-    setBranches([]);
-    setCommits([]);
-    setTree([]);
-    setStatus([]);
-    setStashes([]);
+      setRepo(null);
+      setBranches([]);
+      setCommits([]);
+      setTree([]);
+      setStatus([]);
+      setStashes([]);
+      setConflicts([]);
     setSelected(null);
     setFiles([]);
     setDiff("");
@@ -926,8 +1525,27 @@ function App() {
       await refresh();
     } catch (e) {
       setConsoleText(`> git ${op} 失败\n${String(e)}`);
+      // pull 可能已把仓库带进合并冲突状态——无论成败都刷新，让「冲突」入口及时出现
+      await refresh();
     } finally {
       setOpBusy(null);
+    }
+  }
+
+  // 放弃合并/变基：git merge --abort / git rebase --abort（后端按仓库状态自动选）
+  async function doAbortMerge() {
+    if (!confirm("放弃当前合并/变基？\n所有冲突解决进度都会丢失，工作区回到操作前状态。")) return;
+    try {
+      const msg = await invoke<string>("abort_merge");
+      setConsoleText(msg);
+      setConsoleOpen(true);
+      // 仓库已回滚，冲突面板标签全部失效，关掉回到提交历史
+      const kept = tabs.filter((t) => t.kind !== "merge");
+      setTabs(kept.length ? kept : [{ kind: "history" }]);
+      setActiveTab(0);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -1264,7 +1882,7 @@ function App() {
         <div className="main" style={{ gridTemplateColumns: `${leftW}px 5px 1fr` }}>
           {/* 左栏：文件树 + 工作区状态 */}
           <aside className="pane left">
-            {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 */}
+            {/* 顶部 tab：分支树（默认，IDEA 风格）/ 文件树 / 冲突（有冲突时红色提醒） */}
             <div className="left-tabs">
               <button
                 className={`left-tab ${leftTab === "branches" ? "active" : ""}`}
@@ -1279,9 +1897,73 @@ function App() {
               >
                 文件树
               </button>
+              <button
+                className={`left-tab ${leftTab === "conflicts" ? "active" : ""} ${conflicts.length > 0 ? "alert" : ""}`}
+                onClick={() => setLeftTab("conflicts")}
+                title={
+                  conflicts.length > 0
+                    ? `合并冲突：${conflicts.length} 个文件待解决`
+                    : "合并冲突（无冲突时无内容）"
+                }
+              >
+                冲突{conflicts.length > 0 ? `（${conflicts.length}）` : ""}
+              </button>
             </div>
             <div className="pane-body">
-              {leftTab === "files" ? (
+              {leftTab === "conflicts" ? (
+                <div className="conflict-tree">
+                  <div className="conflict-head">
+                    <span>
+                      {conflicts.length > 0
+                        ? `合并进行中 — ${conflicts.length} 个文件冲突`
+                        : "当前没有合并冲突"}
+                    </span>
+                    {conflicts.length > 0 && (
+                      <button
+                        className="ghost xsmall danger-text"
+                        title="git merge --abort（变基中为 git rebase --abort），放弃后所有解决进度丢失"
+                        onClick={doAbortMerge}
+                      >
+                        放弃合并…
+                      </button>
+                    )}
+                  </div>
+                  {conflicts.length === 0 && <div className="empty-hint">没有需要解决的冲突</div>}
+                  {conflicts.map((c) => (
+                    <div
+                      key={c.path}
+                      className="status-item clickable"
+                      title={`${c.path}（点击打开三路合并面板）`}
+                      onClick={() => openCenterTab("merge", c.path)}
+                    >
+                      <span className="status-badge st-conflict">!</span>
+                      <span className="conflict-path">{c.path}</span>
+                      <span
+                        className="conflict-type"
+                        title={
+                          c.hasOurs && c.hasTheirs
+                            ? "两侧都修改了此文件"
+                            : c.hasTheirs
+                              ? "仅合入方有该文件（本地删除/未新增）"
+                              : "仅本地有该文件（合入方删除）"
+                        }
+                      >
+                        {c.hasOurs && c.hasTheirs ? "双改" : c.hasTheirs ? "仅远程" : "仅本地"}
+                      </span>
+                      <button
+                        className="chip-x"
+                        title="在编辑器中手动处理（逐字修改冲突标记）"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openCenterTab("file", c.path);
+                        }}
+                      >
+                        ✎
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : leftTab === "files" ? (
                 repo.isEmpty ? (
                   <div className="empty-hint">空仓库（尚无提交）</div>
                 ) : (
@@ -1525,7 +2207,18 @@ function App() {
             </div>
             {activeT?.kind !== "history" ? (
               <div className="pane-body tab-view">
-                {tabData[activeKey] === undefined ? (
+                {activeT.kind === "merge" ? (
+                  <MergePanel
+                    path={activeT.path}
+                    onOpenFile={(p) => openCenterTab("file", p)}
+                    onResolved={async () => {
+                      // 已写回并暂存：刷新状态；若该文件不在冲突列表里了就关掉这个面板 tab
+                      await refresh();
+                      closeTab(activeTab);
+                    }}
+                    onAbort={doAbortMerge}
+                  />
+                ) : tabData[activeKey] === undefined ? (
                   <div className="empty-hint">加载中…</div>
                 ) : activeT.kind === "file" ? (
                   <div className="file-edit-wrap">

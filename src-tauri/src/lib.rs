@@ -11,7 +11,9 @@
 //!
 //! git2 使用 default-features=false（无 ssh/https/openssl），只做本地操作。
 
-use git2::{BranchType, DiffFormat, ObjectType, Oid, Repository, Sort, TreeWalkResult};
+use git2::{
+    BranchType, DiffFormat, ObjectType, Oid, Repository, RepositoryState, Sort, TreeWalkResult,
+};
 use serde::{Deserialize, Serialize};
 use tauri::Manager; // AppHandle::path() 来自这个 trait
 use std::collections::HashMap;
@@ -478,8 +480,13 @@ fn get_status(state: tauri::State<AppState>) -> Result<Vec<StatusItem>, String> 
         let statuses = repo.statuses(Some(&mut opts)).map_err(to_err)?;
         let mut out = Vec::new();
         for entry in statuses.iter() {
-            let path = entry.path().unwrap_or("?").to_string();
             let s = entry.status();
+            // 冲突文件不进「更改/不提交」列表——解决入口在左栏「冲突」页，
+            // 否则会混进勾选提交的清单里（冲突未解决前 git 不允许正常暂存提交）
+            if s.is_conflicted() {
+                continue;
+            }
+            let path = entry.path().unwrap_or("?").to_string();
             let status = if s.is_wt_new() || s.is_index_new() {
                 "added"
             } else if s.is_wt_modified() || s.is_index_modified() {
@@ -495,6 +502,143 @@ fn get_status(state: tauri::State<AppState>) -> Result<Vec<StatusItem>, String> 
             out.push(StatusItem { path, status });
         }
         Ok(out)
+    })
+}
+
+// ---------- 合并冲突（pull/merge 进入 MERGE 状态后，左栏「冲突」页数据源） ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictFile {
+    path: String,
+    /// 冲突三侧是否存在：base=合并公共祖先 / ours=本地(HEAD) / theirs=合入方(MERGE_HEAD)。
+    /// 例如「deleted by us / added by them」场景里 ours 或 theirs 会缺位，前端据此给徽标。
+    has_base: bool,
+    has_ours: bool,
+    has_theirs: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictSides {
+    path: String,
+    base: Option<String>,
+    ours: Option<String>,
+    theirs: Option<String>,
+}
+
+/// 遍历 index 的冲突 stage 条目。git 冲突 stages：stage1=base(祖先)、stage2=ours、stage3=theirs。
+/// 返回 (path, base_oid, ours_oid, theirs_oid)，oid 只在对应侧存在时是 Some。
+fn index_conflicts(repo: &Repository) -> Result<Vec<(String, Option<Oid>, Option<Oid>, Option<Oid>)>, String> {
+    let index = repo.index().map_err(to_err)?;
+    let mut out = Vec::new();
+    for item in index.conflicts().map_err(to_err)? {
+        let c = item.map_err(to_err)?;
+        let path = c
+            .our
+            .as_ref()
+            .or(c.their.as_ref())
+            .or(c.ancestor.as_ref())
+            .map(|e| String::from_utf8_lossy(&e.path).to_string())
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        out.push((
+            path,
+            c.ancestor.as_ref().map(|e| e.id),
+            c.our.as_ref().map(|e| e.id),
+            c.their.as_ref().map(|e| e.id),
+        ));
+    }
+    Ok(out)
+}
+
+/// 冲突文件列表（合并进行中才有；无冲突返回空数组）
+#[tauri::command]
+fn get_conflicts(state: tauri::State<AppState>) -> Result<Vec<ConflictFile>, String> {
+    with_repo!(state, repo, {
+        let items = index_conflicts(repo)?;
+        Ok(items
+            .into_iter()
+            .map(|(path, base, ours, theirs)| ConflictFile {
+                path,
+                has_base: base.is_some(),
+                has_ours: ours.is_some(),
+                has_theirs: theirs.is_some(),
+            })
+            .collect())
+    })
+}
+
+/// 读取单个冲突文件的三侧完整内容（直接读 index stage blob，不需要解析磁盘上的 <<<<<<< 标记）。
+/// 大文件截断到 512KB 并追加提示行，与 read_file_content 的策略保持一致。
+fn conflict_sides_for(repo: &Repository, path: &str) -> Result<Option<ConflictSides>, String> {
+    let items = index_conflicts(repo)?;
+    let Some((_, base, ours, theirs)) = items.into_iter().find(|(p, ..)| *p == path) else {
+        return Ok(None);
+    };
+    const LIMIT: usize = 512 * 1024;
+    let read = |oid: Option<Oid>| -> Option<String> {
+        let oid = oid?;
+        let blob = repo.find_blob(oid).ok()?;
+        let bytes = blob.content();
+        // 含 NUL 视为二进制，返回 None（前端判定为「该侧不可用」，避免把乱码当文本写回）
+        if bytes.contains(&0) {
+            return None;
+        }
+        let (slice, truncated) = if bytes.len() > LIMIT {
+            (&bytes[..LIMIT], true)
+        } else {
+            (bytes, false)
+        };
+        let mut text = String::from_utf8_lossy(slice).to_string();
+        if truncated {
+            text.push_str("\n\n…（文件过大，仅显示前 512KB）");
+        }
+        Some(text)
+    };
+    Ok(Some(ConflictSides {
+        path: path.to_string(),
+        base: read(base),
+        ours: read(ours),
+        theirs: read(theirs),
+    }))
+}
+
+#[tauri::command]
+fn get_conflict_sides(state: tauri::State<AppState>, path: String) -> Result<Option<ConflictSides>, String> {
+    with_repo!(state, repo, { conflict_sides_for(repo, &path) })
+}
+
+/// 放弃当前合并/变基，回到操作前状态（git merge --abort / git rebase --abort）。
+/// 走 git CLI：git2 没有等价的单调用，且 abort 要正确处理 index/worktree 回滚。
+#[tauri::command]
+fn abort_merge(state: tauri::State<AppState>) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let st = repo.state();
+        let (args, label) = match st {
+            RepositoryState::Merge => (vec!["merge", "--abort"], "git merge --abort"),
+            RepositoryState::Rebase
+            | RepositoryState::RebaseInteractive
+            | RepositoryState::RebaseMerge => (vec!["rebase", "--abort"], "git rebase --abort"),
+            _ => return Err("当前不处于合并/变基状态，无需放弃".to_string()),
+        };
+        let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?;
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(workdir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|e| format!("无法执行 git（是否已安装并在 PATH 中？）: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+        if out.status.success() {
+            Ok(format!("{label}\n{combined}"))
+        } else {
+            Err(format!("{label} 失败：\n{combined}"))
+        }
     })
 }
 
@@ -968,16 +1112,30 @@ fn commit(state: tauri::State<AppState>, message: String) -> Result<String, Stri
         let tree_oid = index.write_tree().map_err(to_err)?;
         let tree = repo.find_tree(tree_oid).map_err(to_err)?;
 
-        // 有 HEAD 则以 HEAD 为父提交，否则为根提交
-        let parents = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
-            Some(c) => vec![c],
-            None => vec![],
-        };
+        // 父提交集合：正常提交 = [HEAD]；根提交 = []。
+        // merge 进行中（.git/MERGE_HEAD 存在）→ 追加第二父，提交完成后清理合并状态，
+        // 等价于 git commit 收尾一次 merge。
+        let mut parents = Vec::new();
+        if let Some(c) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            parents.push(c);
+        }
+        let mut merging = false;
+        if let Ok(text) = std::fs::read_to_string(repo.path().join("MERGE_HEAD")) {
+            if let Ok(oid) = Oid::from_str(text.trim()) {
+                if let Ok(c) = repo.find_commit(oid) {
+                    parents.push(c);
+                    merging = true;
+                }
+            }
+        }
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
 
         let oid = repo
             .commit(Some("HEAD"), &sig, &sig, &message, &tree, &parent_refs)
             .map_err(to_err)?;
+        if merging {
+            repo.cleanup_state().map_err(to_err)?;
+        }
         Ok(oid.to_string())
     })
 }
@@ -1001,6 +1159,9 @@ pub fn run() {
             get_workdir_diff,
             get_head_tree,
             get_status,
+            get_conflicts,
+            get_conflict_sides,
+            abort_merge,
             checkout_branch,
             create_branch,
             delete_branch,
@@ -1028,4 +1189,126 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------- 冲突处理逻辑单测（真实构造 merge 冲突仓库） ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git 不可用")
+    }
+
+    /// 运行预期成功的 git 命令
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = git(dir, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 运行允许失败（如制造 merge 冲突）的 git 命令
+    fn git_may(dir: &Path, args: &[&str]) {
+        let _ = git(dir, args);
+    }
+
+    fn write(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    /// 建一个冲突仓库并返回其目录（调用方负责删除；tag 用于并行测试下隔离目录）
+    fn make_conflict_repo(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "gitmanage-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git_ok(&dir, &["init", "-b", "main"]);
+        git_ok(&dir, &["config", "user.email", "t@t"]);
+        git_ok(&dir, &["config", "user.name", "t"]);
+        write(&dir, "f.txt", "1\n2\n3\n4\n");
+        git_ok(&dir, &["add", "."]);
+        git_ok(&dir, &["commit", "-m", "base"]);
+
+        // feature 分支把第 2 行改成 F
+        git_ok(&dir, &["checkout", "-b", "feature"]);
+        write(&dir, "f.txt", "1\nF\n3\n4\n");
+        git_ok(&dir, &["add", "."]);
+        git_ok(&dir, &["commit", "-m", "feat"]);
+
+        // main 把第 2 行改成 M —— 与 feature 冲突
+        git_ok(&dir, &["checkout", "main"]);
+        write(&dir, "f.txt", "1\nM\n3\n4\n");
+        git_ok(&dir, &["add", "."]);
+        git_ok(&dir, &["commit", "-m", "main-change"]);
+        git_may(&dir, &["merge", "feature"]); // 必然冲突，git 返回非 0
+
+        dir
+    }
+
+    #[test]
+    fn detect_conflicts_and_read_sides() {
+        let dir = make_conflict_repo("detect");
+        let repo = Repository::open(&dir).unwrap();
+
+        // 仓库应处于 Merge 状态且 index 有冲突
+        assert_eq!(repo.state(), RepositoryState::Merge);
+        let items = index_conflicts(&repo).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "f.txt");
+        assert!(items[0].1.is_some() && items[0].2.is_some() && items[0].3.is_some());
+
+        // sides：base=祖先内容、ours=本地 main 的 M、theirs=feature 的 F
+        let sides = conflict_sides_for(&repo, "f.txt").unwrap().unwrap();
+        assert_eq!(sides.base.as_deref(), Some("1\n2\n3\n4\n"));
+        assert_eq!(sides.ours.as_deref(), Some("1\nM\n3\n4\n"));
+        assert_eq!(sides.theirs.as_deref(), Some("1\nF\n3\n4\n"));
+
+        // 磁盘文件应带冲突标记（模拟 MergePanel 读取的输入）
+        let disk = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(disk.contains("<<<<<<<"), "磁盘应有冲突标记");
+        assert!(disk.contains(">>>>>>>"));
+
+        // 不存在的 path 返回 None
+        assert!(conflict_sides_for(&repo, "nope.txt").unwrap().is_none());
+        drop(repo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_and_abort() {
+        let dir = make_conflict_repo("resolve");
+
+        // 方式一：git add = 标记解决（等价前端「标记已解决」的 stage_files）
+        git_ok(&dir, &["add", "f.txt"]);
+        {
+            let repo = Repository::open(&dir).unwrap();
+            assert!(index_conflicts(&repo).unwrap().is_empty());
+            assert_eq!(repo.state(), RepositoryState::Merge);
+        }
+
+        // 方式二：abort 回滚到冲突前
+        git_ok(&dir, &["merge", "--abort"]);
+        {
+            let repo = Repository::open(&dir).unwrap();
+            assert_eq!(repo.state(), RepositoryState::Clean);
+            assert!(index_conflicts(&repo).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
