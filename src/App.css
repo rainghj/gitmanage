@@ -882,6 +882,35 @@ button.ghost.small {
   white-space: pre;
 }
 
+/* 高亮预览的代码容器（等宽、不自动换行） */
+.file-content {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 8px 12px;
+  white-space: pre;
+  margin: 0;
+}
+
+/* 高亮预览：继承 hljs 主题的配色，但背景跟随应用底色 */
+.hljs-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+}
+
+.hljs-body code {
+  background: transparent;
+  padding: 0;
+}
+
+/* 预览/编辑切换按钮的激活态 */
+.ghost.small.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* 可点击的「更改」条目 */
 .status-item.clickable {
   cursor: pointer;

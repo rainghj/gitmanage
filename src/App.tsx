@@ -2,7 +2,90 @@ import { useState, useEffect, useCallback, useMemo, useRef, Component } from "re
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import hljs from "highlight.js/lib/core";
+// 只注册常用语言，控制 bundle 体积
+import rust from "highlight.js/lib/languages/rust";
+import typescript from "highlight.js/lib/languages/typescript";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import markdown from "highlight.js/lib/languages/markdown";
+import yaml from "highlight.js/lib/languages/yaml";
+import ini from "highlight.js/lib/languages/ini";
+import css from "highlight.js/lib/languages/css";
+import xml from "highlight.js/lib/languages/xml";
+import bash from "highlight.js/lib/languages/bash";
+import python from "highlight.js/lib/languages/python";
+import cpp from "highlight.js/lib/languages/cpp";
+import java from "highlight.js/lib/languages/java";
+import sql from "highlight.js/lib/languages/sql";
+import "highlight.js/styles/vs2015.css"; // VS Code 深色风，贴合整体蓝灰调
 import "./App.css";
+
+hljs.registerLanguage("rust", rust);
+hljs.registerLanguage("typescript", typescript);
+hljs.registerLanguage("javascript", javascript);
+hljs.registerLanguage("json", json);
+hljs.registerLanguage("markdown", markdown);
+hljs.registerLanguage("yaml", yaml);
+hljs.registerLanguage("ini", ini);
+hljs.registerLanguage("css", css);
+hljs.registerLanguage("xml", xml);
+hljs.registerLanguage("bash", bash);
+hljs.registerLanguage("python", python);
+hljs.registerLanguage("cpp", cpp);
+hljs.registerLanguage("java", java);
+hljs.registerLanguage("sql", sql);
+
+// 扩展名 → hljs 语言 id（未识别的走 highlightAuto）
+const EXT_LANG: Record<string, string> = {
+  rs: "rust",
+  ts: "typescript",
+  tsx: "typescript",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  json: "json",
+  md: "markdown",
+  yml: "yaml",
+  yaml: "yaml",
+  toml: "ini",
+  ini: "ini",
+  cfg: "ini",
+  css: "css",
+  html: "xml",
+  htm: "xml",
+  vue: "xml",
+  svg: "xml",
+  sh: "bash",
+  bash: "bash",
+  py: "python",
+  c: "cpp",
+  h: "cpp",
+  cpp: "cpp",
+  java: "java",
+  sql: "sql",
+};
+
+// 只读高亮代码视图（hljs 输出自带转义，可安全 innerHTML）
+function HighlightedCode({ code, path }: { code: string; path: string }) {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  const lang = EXT_LANG[ext];
+  const html = useMemo(() => {
+    try {
+      return lang
+        ? hljs.highlight(code, { language: lang }).value
+        : hljs.highlightAuto(code).value;
+    } catch {
+      return null;
+    }
+  }, [code, lang]);
+  if (html === null) return <pre className="file-content">{code}</pre>;
+  return (
+    <pre className="file-content hljs-body">
+      <code dangerouslySetInnerHTML={{ __html: html }} />
+    </pre>
+  );
+}
 
 // ---------- 错误边界：渲染崩溃时显示错误内容，避免黑屏无从排查 ----------
 
@@ -399,6 +482,8 @@ function App() {
   const [discardConfirm, setDiscardConfirm] = useState<string | null>(null);
   // Stash 区默认折叠（低频功能），点标题展开
   const [stashOpen, setStashOpen] = useState(false);
+  // 文件标签：默认高亮预览，点「编辑」才切到可编辑文本框
+  const [fileEditMode, setFileEditMode] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!repo) return;
@@ -511,6 +596,11 @@ function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeKey, tabData]);
+
+  // 切换标签时回到预览模式
+  useEffect(() => {
+    setFileEditMode(false);
+  }, [activeKey]);
 
 // 打开仓库。路径一律显式传入（浏览…/最近列表/示例链接），输入框只做展示不承接输入
   async function openRepo(path: string) {
@@ -1350,6 +1440,20 @@ function App() {
                       <span className="file-edit-path" title={activeT.path}>
                         {activeT.path}
                       </span>
+                      <button
+                        className={`ghost small ${fileEditMode ? "" : "on"}`}
+                        title="语法高亮只读预览"
+                        onClick={() => setFileEditMode(false)}
+                      >
+                        预览
+                      </button>
+                      <button
+                        className={`ghost small ${fileEditMode ? "on" : ""}`}
+                        title="纯文本编辑（无高亮）"
+                        onClick={() => setFileEditMode(true)}
+                      >
+                        编辑
+                      </button>
                       {isDirty(activeT) && (
                         <>
                           <button className="ghost small" onClick={() => saveFileTab(activeT)}>
@@ -1361,23 +1465,31 @@ function App() {
                         </>
                       )}
                     </div>
-                    <textarea
-                      className="file-editor"
-                      spellCheck={false}
-                      value={tabDrafts[activeKey] ?? tabData[activeKey]}
-                      onChange={(e) => {
-                        // 注意：currentTarget 在事件分发结束后被 React 置 null，
-                        // 必须先取出 value 再进 setState 更新器，否则更新器执行时访问 null.value 崩溃
-                        const v = e.currentTarget.value;
-                        setTabDrafts((m) => ({ ...m, [activeKey]: v }));
-                      }}
-                      onKeyDown={(e) => {
-                        if ((e.ctrlKey || e.metaKey) && e.key === "s") {
-                          e.preventDefault();
-                          saveFileTab(activeT);
-                        }
-                      }}
-                    />
+                    {fileEditMode ? (
+                      <textarea
+                        className="file-editor"
+                        spellCheck={false}
+                        value={tabDrafts[activeKey] ?? tabData[activeKey]}
+                        onChange={(e) => {
+                          // 注意：currentTarget 在事件分发结束后被 React 置 null，
+                          // 必须先取出 value 再进 setState 更新器，否则更新器执行时访问 null.value 崩溃
+                          const v = e.currentTarget.value;
+                          setTabDrafts((m) => ({ ...m, [activeKey]: v }));
+                        }}
+                        onKeyDown={(e) => {
+                          if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+                            e.preventDefault();
+                            saveFileTab(activeT);
+                          }
+                        }}
+                      />
+                    ) : (
+                      // 预览也展示草稿内容（若有未保存修改），保证所见即所得
+                      <HighlightedCode
+                        code={tabDrafts[activeKey] ?? tabData[activeKey]}
+                        path={activeT.path}
+                      />
+                    )}
                   </div>
                 ) : (
                   <DiffView text={tabData[activeKey]} hint="该文件当前没有工作区改动" />
