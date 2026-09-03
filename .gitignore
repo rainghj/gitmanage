@@ -27,3 +27,4 @@ dist-ssr
 
 # 会话/工具临时文件
 _tmp_*
+_scratch/

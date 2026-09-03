@@ -279,84 +279,144 @@ function TreeNodeRow({
 //   - 第一父提交接管当前泳道；merge 的其他父提交另开泳道（这就是分叉/汇合的来源）
 
 interface GraphRow {
-  lane: number; // 本行 commit 所在泳道
-  occupied: boolean[]; // 本行有哪些泳道有竖线穿过
-  mergeLane: number | null; // merge 提交第二父所在泳道（画汇合曲线用）
+  lane: number; // 本行提交节点所在泳道
+  top: number[]; // 从上方延续进入本行的泳道（画竖线 0→midY）
+  bot: number[]; // 本行向下延续的泳道（画竖线 midY→ROW_H；不含 born）
+  born: number[]; // merge 第二父「出生」泳道：节点向下画弧连到该泳道（分出新支）
+  converge: number[]; // 共享父的「收拢」泳道：从该泳道顶部画弧收进本行节点（两支汇到一点）
   isMerge: boolean;
 }
 
-const GRAPH_LANE_W = 14; // 每条泳道宽度
-const GRAPH_ROW_H = 28; // 行高，需与 CSS .commit-item 的高度一致
+const GRAPH_LANE_W = 16; // 每条泳道宽度
+const GRAPH_ROW_H = 30; // 行高，需与 CSS .commit-item 的高度一致
 const LANE_COLORS = ["#569cd6", "#4ec9b0", "#d7ba7d", "#ce9178", "#b5cea8", "#9cdcfe"];
 
 function computeGraph(commits: CommitInfo[]): { rows: GraphRow[]; laneCount: number } {
+  // lanes[i] = 泳道 i 下一个期待出现的 commit oid；非空表示该泳道有竖线从上方延续下来
   const lanes: (string | null)[] = [];
   const rows: GraphRow[] = commits.map((c) => {
+    // 1) 定位本提交所在泳道（父们已把期待 oid 放进 lanes，命中即接管该泳道）
     let idx = lanes.indexOf(c.oid);
     if (idx === -1) {
+      // 头部/分页截断后第一个出现的提交：复用空位或新开
       const free = lanes.indexOf(null);
-      if (free === -1) {
-        idx = lanes.length;
-        lanes.push(null);
-      } else {
-        idx = free;
+      idx = free === -1 ? lanes.length : free;
+      if (free === -1) lanes.push(null);
+    }
+    // 2) 收拢：其它泳道也期待同一个 oid（两条支线共享同一父）
+    //    → 该泳道竖线不再直穿，改为画弧收进本行节点，然后终止
+    const converge: number[] = [];
+    for (let i = 0; i < lanes.length; i++) {
+      if (i !== idx && lanes[i] === c.oid) {
+        converge.push(i);
+        lanes[i] = null;
       }
     }
-    // 快照：本行有竖线穿过的泳道
-    const occupied = lanes.map((o) => o !== null);
-
-    // merge：第二父提交另开一条泳道
-    let mergeLane: number | null = null;
-    if (c.parents.length > 1) {
-      const free = lanes.indexOf(null);
-      mergeLane = free === -1 ? lanes.length : free;
-      if (free === -1) lanes.push(null);
-      lanes[mergeLane] = c.parents[1];
-      occupied[mergeLane] = true;
-    }
-
-    // 第一父接管当前泳道
+    // 3) 顶部延续：处理前仍非空的泳道（converge 已置空，剩真正直穿下来的）
+    const top: number[] = [];
+    lanes.forEach((o, i) => {
+      if (o !== null) top.push(i);
+    });
+    // 4) 第一父先接管当前泳道（先占位，保证 born 分配不会撞到 idx）
     lanes[idx] = c.parents[0] ?? null;
-    return { lane: idx, occupied, mergeLane, isMerge: c.parents.length > 1 };
+    // 5) merge：parents[1..] 每个第二父开一条「出生」泳道（弧从本节点分出新支）
+    const born: number[] = [];
+    for (const p of c.parents.slice(1)) {
+      let m = -1;
+      for (let j = 0; j < lanes.length; j++) {
+        if (j !== idx && lanes[j] === null) {
+          m = j;
+          break;
+        }
+      }
+      if (m === -1) {
+        m = lanes.length;
+        lanes.push(null);
+      }
+      lanes[m] = p;
+      born.push(m);
+    }
+    // 6) 底部延续：处理后非空且非 born 的泳道（born 用弧表达，不再画竖线）
+    const bot: number[] = [];
+    lanes.forEach((o, i) => {
+      if (o !== null && !born.includes(i)) bot.push(i);
+    });
+    return { lane: idx, top, bot, born, converge, isMerge: c.parents.length > 1 };
   });
 
-  const laneCount = Math.max(1, ...rows.map((r) => Math.max(r.occupied.length, r.lane + 1)));
+  // 宽度取全局最大泳道下标 + 1（数组可能含空洞，不能用 length）
+  const laneCount = Math.max(
+    1,
+    ...rows.map((r) => Math.max(r.lane, ...r.top, ...r.bot, ...r.born, ...r.converge) + 1)
+  );
   return { rows, laneCount };
 }
 
-function CommitGraph({ row, laneCount, isLast }: { row: GraphRow; laneCount: number; isLast: boolean }) {
+function CommitGraph({ row, laneCount }: { row: GraphRow; laneCount: number }) {
   const w = laneCount * GRAPH_LANE_W;
   const x = (i: number) => i * GRAPH_LANE_W + GRAPH_LANE_W / 2;
   const midY = GRAPH_ROW_H / 2;
-  const color = LANE_COLORS[row.lane % LANE_COLORS.length];
+  const laneColor = (i: number) => LANE_COLORS[i % LANE_COLORS.length];
 
   return (
     <svg className="commit-graph" width={w} height={GRAPH_ROW_H} viewBox={`0 0 ${w} ${GRAPH_ROW_H}`}>
-      {/* 竖线：穿过本行的每条泳道 */}
-      {row.occupied.map((on, i) =>
-        on ? (
-          <line
-            key={i}
-            x1={x(i)}
-            y1={0}
-            x2={x(i)}
-            y2={isLast ? midY : GRAPH_ROW_H}
-            stroke={LANE_COLORS[i % LANE_COLORS.length]}
-            strokeWidth={2}
-          />
-        ) : null
-      )}
-      {/* merge 汇合曲线：从本行圆心绕到第二父泳道 */}
-      {row.mergeLane !== null && (
-        <path
-          d={`M ${x(row.lane)} ${midY} C ${x(row.lane)} ${GRAPH_ROW_H}, ${x(row.mergeLane)} ${midY}, ${x(row.mergeLane)} ${GRAPH_ROW_H}`}
-          fill="none"
-          stroke={LANE_COLORS[row.mergeLane % LANE_COLORS.length]}
-          strokeWidth={2}
+      {/* 顶部延续竖线：0→midY（从上方直穿下来，进本行节点或继续向下） */}
+      {row.top.map((i) => (
+        <line
+          key={`t${i}`}
+          x1={x(i)}
+          y1={0}
+          x2={x(i)}
+          y2={midY}
+          stroke={laneColor(i)}
+          strokeWidth={1.5}
+          strokeLinecap="round"
         />
-      )}
-      {/* 本行提交节点 */}
-      <circle cx={x(row.lane)} cy={midY} r={4} fill={color} stroke="#1e1e1e" strokeWidth={1.5} />
+      ))}
+      {/* 底部延续竖线：midY→ROW_H（从本行节点继续向下延伸到下一行） */}
+      {row.bot.map((i) => (
+        <line
+          key={`b${i}`}
+          x1={x(i)}
+          y1={midY}
+          x2={x(i)}
+          y2={GRAPH_ROW_H}
+          stroke={laneColor(i)}
+          strokeWidth={1.5}
+          strokeLinecap="round"
+        />
+      ))}
+      {/* merge 出生弧：从本节点向下弯到新泳道——表示「从这里分出一条新支」
+          三次贝塞尔：起点切线沿节点泳道竖直到 60% 行高 (P1=(x_lane, 0.4H+0.6*(H-0.4H))=
+          midY + 0.6*(H-midY))，末段切线沿 born 泳道竖直到行底 (P2=(x_m, H-0.4*(H-midY)))。
+          末段最后 40% 行高与下一行 top 同向竖直下行，衔接到 (x_m, 0) 时无方向突变
+          ——消除 P2=P3 时末段水平切线与下一行 top 竖直切线在行底交接的 90° 锐角 */}
+      {row.born.map((m) => (
+        <path
+          key={`n${m}`}
+          d={`M ${x(row.lane)} ${midY} C ${x(row.lane)} ${midY + (GRAPH_ROW_H - midY) * 0.6}, ${x(m)} ${GRAPH_ROW_H - (GRAPH_ROW_H - midY) * 0.4}, ${x(m)} ${GRAPH_ROW_H}`}
+          fill="none"
+          stroke={laneColor(m)}
+          strokeWidth={1.5}
+          strokeLinecap="round"
+        />
+      ))}
+      {/* 共享父收拢弧：从泳道顶部弯进本行节点——表示「两条支线汇到这一点」
+        三次贝塞尔：P1=(x_i, 0.6H) 让起点切线沿支线向下，P2=(x_node, 0.4H) 让末端切线沿节点泳道向下。
+        末段 0.4H 范围内沿节点泳道竖直下落，与节点下方 bot 同向合流（消除 Q 曲线末端水平进入与
+        bot 竖直线造成的锐角折点） */}
+      {row.converge.map((i) => (
+        <path
+          key={`v${i}`}
+          d={`M ${x(i)} 0 C ${x(i)} ${midY * 0.6}, ${x(row.lane)} ${midY * 0.4}, ${x(row.lane)} ${midY}`}
+          fill="none"
+          stroke={laneColor(i)}
+          strokeWidth={1.5}
+          strokeLinecap="round"
+        />
+      ))}
+      {/* 本行提交节点：纯实心（IDEA 风格）。不要描边——深色描边在小尺寸下会让圆心被吞掉，看着像空心环 */}
+      <circle cx={x(row.lane)} cy={midY} r={5} fill={laneColor(row.lane)} />
     </svg>
   );
 }
@@ -2559,11 +2619,7 @@ function App() {
                   }}
                 >
                   <div className="commit-row">
-                    <CommitGraph
-                      row={graphRows[i]}
-                      laneCount={laneCount}
-                      isLast={i === commits.length - 1}
-                    />
+                    <CommitGraph row={graphRows[i]} laneCount={laneCount} />
                     {/* 单行布局（IDEA 风格）：hash + refs + message 省略号，作者·时间右对齐 */}
                     <div className="commit-summary">
                       <span className="hash">{c.short}</span>
