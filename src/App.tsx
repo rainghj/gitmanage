@@ -438,12 +438,47 @@ function extractFileDiff(full: string, path: string): string {
 
 function DiffView({ text, hint = "选择左侧提交查看改动" }: { text: string; hint?: string }) {
   if (!text) return <div className="empty-hint">{hint}</div>;
+  const lines = text.split("\n");
+  // 首/尾空行是 === 分隔行自带换行的残留，跳过不占行高
+  const start = lines[0] === "" ? 1 : 0;
+  const end = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+  // 预扫描：按 === path === 分隔统计每个文件的 +/− 行数（文件头右侧展示）
+  const stats = new Map<string, [number, number]>();
+  let cur: string | null = null;
+  for (let i = start; i < end; i++) {
+    const m = lines[i].match(/^=== (.+) ===$/);
+    if (m) {
+      cur = m[1];
+      stats.set(cur, [0, 0]);
+      continue;
+    }
+    if (cur) {
+      const s = stats.get(cur)!;
+      if (lines[i].startsWith("+")) s[0]++;
+      else if (lines[i].startsWith("-")) s[1]++;
+    }
+  }
   return (
     <pre className="diff-pre">
-      {text.split("\n").map((line, i) => {
+      {lines.slice(start, end).map((line, i) => {
+        // 文件分隔头：渲染成独立条状头部（色块 + 亮边线），不再显示 === xxx === 文本
+        const fm = line.match(/^=== (.+) ===$/);
+        if (fm) {
+          const [add, del] = stats.get(fm[1]) ?? [0, 0];
+          return (
+            <div key={i} className="diff-file" title={fm[1]}>
+              <span className="diff-file-name">{fm[1]}</span>
+              {(add > 0 || del > 0) && (
+                <span className="diff-file-nums">
+                  {del > 0 && <span className="del">−{del}</span>}
+                  {add > 0 && <span className="add">+{add}</span>}
+                </span>
+              )}
+            </div>
+          );
+        }
         let cls = "diff-line";
-        if (line.startsWith("===")) cls += " diff-file";
-        else if (line.startsWith("+")) cls += " diff-add";
+        if (line.startsWith("+")) cls += " diff-add";
         else if (line.startsWith("-")) cls += " diff-del";
         else if (line.startsWith("@@")) cls += " diff-hunk";
         return (
@@ -1986,11 +2021,6 @@ function App() {
           浏览…
         </button>
         {repo && (
-          <button className="ghost" onClick={refresh}>
-            刷新
-          </button>
-        )}
-        {repo && (
           <button className="ghost" onClick={closeRepo} title="关闭当前仓库，回到欢迎页">
             关闭
           </button>
@@ -2239,7 +2269,16 @@ function App() {
                 </div>
               )}
             </div>
-            <div className="pane-title">更改（{visibleStatus.length}）</div>
+            <div className="pane-title">
+              更改（{visibleStatus.length}）
+              <button
+                className="ghost small pane-title-btn"
+                title="刷新仓库状态（重新扫描更改、分支、提交历史）"
+                onClick={refresh}
+              >
+                ⟳
+              </button>
+            </div>
             <div className="pane-body status-list">
               {visibleStatus.length === 0 && <div className="empty-hint">工作区干净</div>}
               {visibleStatus.map((s) => (
@@ -2610,7 +2649,7 @@ function App() {
               {commits.map((c, i) => (
                 <div
                   key={c.oid}
-                  className={`commit-item ${selected === c.oid ? "selected" : ""}`}
+                  className={`commit-item ${selected === c.oid ? "selected" : ""}${c.parents.length > 1 ? " is-merge" : ""}`}
                   onClick={() => setSelected(c.oid)}
                   onContextMenu={(e) => {
                     e.preventDefault();

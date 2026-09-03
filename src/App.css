@@ -1196,6 +1196,18 @@ button.ghost.small {
   color: var(--text-dim);
 }
 
+/* merge 提交整行文字降暗，与普通提交一眼区分（IDEA 风格：合并行弱化为次要视觉层级） */
+.commit-item.is-merge .hash,
+.commit-item.is-merge .summary-text {
+  opacity: 0.55;
+}
+
+/* 选中/hover 时仍保持可读性：降暗程度略收，避免深蓝选中底上文字发虚 */
+.commit-item.is-merge.selected .hash,
+.commit-item.is-merge.selected .summary-text {
+  opacity: 0.8;
+}
+
 /* ---------- 右栏 ---------- */
 
 /* 提交详情头（IDEA 风格：选中提交的完整信息常驻顶部） */
@@ -1248,12 +1260,50 @@ button.ghost.small {
   padding: 0 8px;
 }
 
+/* 文件分隔头：块状色条 + 顶部亮线，与 diff 底色拉开对比，一眼区分文件边界。
+   顺带在右侧展示该文件的 +/− 行数统计（数值在 App.tsx DiffView 预扫描算出） */
 .diff-file {
-  background: var(--panel);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px; /* 与上一文件末尾留出空隙，形成「隔断」 */
+  padding: 3px 8px;
+  background: var(--panel-2);
+  border-top: 1px solid #4a4a4f; /* 文件边界亮线 */
   color: var(--accent);
   font-weight: 600;
-  padding: 4px 8px;
-  margin-top: 4px;
+}
+
+/* diff 顶部第一个文件头：不留空隙、不画顶线，避免多余的边 */
+.diff-file:first-child {
+  margin-top: 0;
+  border-top: none;
+}
+
+.diff-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-nums {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.diff-file-nums .add {
+  color: var(--green);
+}
+
+.diff-file-nums .del {
+  color: var(--red);
 }
 
 .diff-add {
