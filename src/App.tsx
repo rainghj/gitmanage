@@ -1375,6 +1375,8 @@ function App() {
   const [renameValue, setRenameValue] = useState("");
   // Stash 区默认折叠（低频功能），点标题展开
   const [stashOpen, setStashOpen] = useState(false);
+  // 「不提交」区默认展开，点标题可折叠；列表高度限制为约一半，超出动条
+  const [skipOpen, setSkipOpen] = useState(true);
   // 文件标签：默认高亮预览，点「编辑」才切到可编辑文本框
   const [fileEditMode, setFileEditMode] = useState(false);
   // 布局尺寸（可拖动，localStorage 记忆）：左栏宽度 / 右栏占比 / 控制台高度
@@ -2338,10 +2340,18 @@ function App() {
               </div>
             )}
 
-            {/* 「不提交」：本地修改但不想提交的文件，右键可移回更改；列表存在 .git/info 里 */}
+            {/* 「不提交」：本地修改但不想提交的文件，右键可移回更改；列表存在 .git/info 里。
+                标题可折叠（同 Stash），列表本体高度压到约一半，超出滚动 */}
             {skippedStatus.length > 0 && (
               <>
-                <div className="pane-title">不提交（{skippedStatus.length}）</div>
+                <div
+                  className="pane-title clickable"
+                  title={skipOpen ? "点击折叠" : "点击展开"}
+                  onClick={() => setSkipOpen((o) => !o)}
+                >
+                  {skipOpen ? "▾" : "▸"} 不提交（{skippedStatus.length}）
+                </div>
+                {skipOpen && (
                 <div className="pane-body status-list skip-list">
                   {skippedStatus.map((s) => (
                     <div
@@ -2361,6 +2371,7 @@ function App() {
                     </div>
                   ))}
                 </div>
+                )}
               </>
             )}
 

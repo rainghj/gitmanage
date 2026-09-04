@@ -981,7 +981,12 @@ button.ghost.small {
   cursor: pointer;
 }
 
-/* 「不提交」分区：整体降灰，表示不参与提交 */
+/* 「不提交」分区：整体降灰，表示不参与提交；
+   高度压到约「更改」列表（max-height:30%）的一半，超出滚动，给 Stash/提交区让空间 */
+.skip-list {
+  max-height: 15%;
+}
+
 .skip-list .status-item {
   opacity: 0.55;
 }
