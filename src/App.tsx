@@ -1382,7 +1382,7 @@ function App() {
   // 布局尺寸（可拖动，localStorage 记忆）：左栏宽度 / 右栏占比 / 控制台高度
   const [leftW, setLeftW] = usePersistentNumber("gm.leftW", 260);
   const [rightShare, setRightShare] = usePersistentNumber("gm.rightShare", 0.545);
-  const [consoleH, setConsoleH] = usePersistentNumber("gm.consoleH", 180);
+  const [consoleH, setConsoleH] = usePersistentNumber("gm.consoleH.v3", 150);
   const workspaceRowRef = useRef<HTMLDivElement>(null);
   // 提交历史分页：默认 300 条，列表底部「加载更多」每次 +300
   const [logLimit, setLogLimit] = useState(300);
@@ -2772,7 +2772,7 @@ function App() {
           )}
             </div>
 
-            {/* 控制台|工作区 横向拖动条（仅展开时可拖，双击恢复默认 180px） */}
+            {/* 控制台|工作区 横向拖动条（仅展开时可拖，双击恢复默认 150px） */}
             {consoleOpen && (
               <div
                 className="divider-h"
@@ -2780,11 +2780,12 @@ function App() {
                 onPointerDown={(e) => {
                   const start = consoleH;
                   const startY = e.clientY;
+                  const maxH = Math.round(window.innerHeight * 0.7);
                   startDrag(e, "row-resize", (ev) =>
-                    setConsoleH(clamp(start - (ev.clientY - startY), 100, 400))
+                    setConsoleH(clamp(start - (ev.clientY - startY), 100, maxH))
                   );
                 }}
-                onDoubleClick={() => setConsoleH(180)}
+                onDoubleClick={() => setConsoleH(150)}
               />
             )}
 
@@ -2798,15 +2799,16 @@ function App() {
                   if ((e.target as HTMLElement).closest("button")) return;
                   const start = consoleH;
                   const startY = e.clientY;
+                  const maxH = Math.round(window.innerHeight * 0.7);
                   const wasOpen = consoleOpen;
                   if (!wasOpen) setConsoleOpen(true); // 折叠时拖动直接展开
                   startDrag(e, "row-resize", (ev) =>
-                    setConsoleH(clamp((wasOpen ? start : 180) - (ev.clientY - startY), 100, 400))
+                    setConsoleH(clamp((wasOpen ? start : 150) - (ev.clientY - startY), 100, maxH))
                   );
                 }}
                 onDoubleClick={(e) => {
                   if ((e.target as HTMLElement).closest("button")) return;
-                  setConsoleH(180);
+                  setConsoleH(150);
                 }}
               >
                 <span>控制台输出</span>

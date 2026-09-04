@@ -1496,7 +1496,7 @@ button.ghost.small {
 
 /* ---------- 控制台面板 ---------- */
 
-/* 控制台：折叠时只有标题栏一条；展开时内容区 180px */
+/* 控制台：折叠时只有标题栏一条；展开时内容区默认 240px（App.tsx consoleH 内联覆盖，可拖动） */
 .console-bar {
   border-top: 1px solid var(--border);
   background: #0e0e0e;
@@ -1538,13 +1538,10 @@ button.ghost.small {
   cursor: pointer;
 }
 
+/* 控制台内容区：高度由内联 style（consoleH，可拖拽）驱动，flex 必须为 none，
+   否则 flex-basis:0% 会覆盖 height，导致控制台塌成内容高度、拖拽"失效" */
 .console-body {
   flex: none;
-  height: 180px;
-}
-
-.console-body {
-  flex: 1;
   overflow: auto;
   margin: 0;
   padding: 8px 12px;
