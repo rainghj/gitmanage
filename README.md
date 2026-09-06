@@ -4,6 +4,9 @@ Windows 11 上的轻量级 Git 管理器，对标 IntelliJ IDEA 的 Git 工具�
 
 技术栈：Tauri v2（Rust 后端）+ React 19 + TypeScript + pnpm，Git 操作基于 libgit2（`git2-rs`）。
 
+# 启动 
+pnpm tauri dev
+
 ## 运行环境
 
 GitManage 是编译好的桌面程序，**运行期**需要：
