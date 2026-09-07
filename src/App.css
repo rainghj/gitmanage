@@ -95,6 +95,59 @@ body {
   cursor: pointer;
 }
 
+/* ---------- 顶部栏仓库徽标（IDEA git widget 风格：仓库名 + 分支） ---------- */
+
+.repo-widget {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.repo-widget:hover {
+  border-color: var(--accent-2);
+}
+
+.repo-widget-name {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.repo-widget-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.repo-widget-chip .branch-glyph {
+  flex-shrink: 0;
+  color: var(--accent-2);
+}
+
+.repo-widget-chip.remote {
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+.repo-widget-sep {
+  color: var(--border);
+  flex-shrink: 0;
+}
+
 .repo-input[readonly].has-repo:hover {
   border-color: var(--accent-2);
 }

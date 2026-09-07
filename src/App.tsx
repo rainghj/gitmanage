@@ -1297,6 +1297,39 @@ const STATUS_LABEL: Record<string, string> = {
   other: "?",
 };
 
+// ---------- 顶部栏仓库徽标（IDEA git widget 风格） ----------
+
+// 线框风格的分支小图标（本地分支 / 远程跟踪分支两种形态）
+function BranchGlyph({ remote = false }: { remote?: boolean }) {
+  return (
+    <svg
+      className="branch-glyph"
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle cx="4" cy="3.5" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="4" cy="12.5" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M4 5.4v5.2" stroke="currentColor" strokeWidth="1.3" />
+      {remote ? (
+        // 远程形态：另一条线弯进来（表示跟踪关系）
+        <>
+          <circle cx="12" cy="3.5" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+          <path d="M12 5.4v1c0 1.6-1.3 2.6-2.9 2.6H7" stroke="currentColor" strokeWidth="1.3" />
+        </>
+      ) : (
+        // 本地形态：从主干中部弯出去一条支线
+        <>
+          <circle cx="12" cy="3.5" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+          <path d="M4 8.2h4.8c1.8 0 3.2-1 3.2-2.8v-1" stroke="currentColor" strokeWidth="1.3" />
+        </>
+      )}
+    </svg>
+  );
+}
+
 // ---------- 通用小工具 ----------
 
 function useDebounced<T>(value: T, ms: number): T {
@@ -1905,25 +1938,54 @@ function App() {
       <header className="topbar">
         <span className="logo">GitManage</span>
         <div className="path-menu-wrap" ref={pathMenuRef}>
-          {/* 纯展示框：只显示当前仓库路径。开仓库走「浏览…」/ 最近列表，这里不承接输入 */}
-          <input
-            className={"repo-input" + (repo ? " has-repo" : "")}
-            placeholder="点「浏览…」选择仓库目录，或从最近打开中选择"
-            value={repoPath}
-            readOnly
-            onClick={() => {
-              // 已开仓库时点显示框弹统一菜单
-              if (repo) {
+          {/* 已开仓库：IDEA git widget 风格徽标（仓库名 + 当前分支 + 上游分支），完整路径在 tooltip 与菜单里 */}
+          {repo ? (
+            <button
+              type="button"
+              className="repo-widget"
+              onClick={() => {
                 const next = !pathMenuOpen;
                 setPathMenuOpen(next);
                 if (next) {
                   const idx = recent.findIndex((r) => r.path === repo.path);
                   setRecentMenuIndex(idx >= 0 ? idx : 0);
                 }
-              }
-            }}
-            title={repo ? "点击打开仓库菜单（切换 / 在资源管理器中打开 / 复制路径）" : "点「浏览…」选择仓库目录"}
-          />
+              }}
+              title={`${repo.path}\n点击打开仓库菜单（切换 / 在资源管理器中打开 / 复制路径）`}
+            >
+              <span className="repo-widget-name">{repo.name}</span>
+              {repo.currentBranch && (
+                <span className="repo-widget-chip" title={`当前分支：${repo.currentBranch}`}>
+                  <BranchGlyph />
+                  {repo.currentBranch}
+                </span>
+              )}
+              {(() => {
+                // 当前分支的上游跟踪分支（origin/main → 显示为 main，与参考样式一致）
+                const upstream = branches.find((b) => !b.isRemote && b.isHead)?.upstream;
+                if (!upstream) return null;
+                const short = upstream.startsWith("origin/") ? upstream.slice(7) : upstream;
+                return (
+                  <>
+                    <span className="repo-widget-sep">/</span>
+                    <span className="repo-widget-chip remote" title={`跟踪分支：${upstream}`}>
+                      <BranchGlyph remote />
+                      {short}
+                    </span>
+                  </>
+                );
+              })()}
+            </button>
+          ) : (
+            /* 欢迎页（未开仓库）：保留原展示框 */
+            <input
+              className="repo-input"
+              placeholder="点「浏览…」选择仓库目录，或从最近打开中选择"
+              value=""
+              readOnly
+              title="点「浏览…」选择仓库目录"
+            />
+          )}
           {repo && pathMenuOpen && (
             <div className="recent-menu path-menu" role="menu">
               {/* 当前仓库信息 */}
