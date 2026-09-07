@@ -12,7 +12,8 @@
 //! git2 使用 default-features=false（无 ssh/https/openssl），只做本地操作。
 
 use git2::{
-    BranchType, DiffFormat, ObjectType, Oid, Repository, RepositoryState, Sort, TreeWalkResult,
+    opts, BranchType, DiffFormat, ErrorCode, ObjectType, Oid, Repository, RepositoryState, Sort,
+    TreeWalkResult,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager; // AppHandle::path() 来自这个 trait
@@ -132,13 +133,58 @@ macro_rules! with_repo {
 
 // ---------- Tauri 命令 ----------
 
+/// 先 discover（沿目录向上逐级找 .git），失败再退回严格 open；两次的错误都带回来用于诊断
+fn try_open_repo(path: &str) -> Result<Repository, (git2::Error, git2::Error)> {
+    match Repository::discover(path) {
+        Ok(r) => Ok(r),
+        Err(e1) => Repository::open(path).map_err(|e2| (e1, e2)),
+    }
+}
+
 #[tauri::command]
 fn open_repo(state: tauri::State<AppState>, path: String) -> Result<RepoSummary, String> {
-    // discover 会沿目录向上逐级找 .git，因此选中仓库的子目录也能打开；
-    // 找不到再退回严格 open，两者都失败才报错
-    let repo = Repository::discover(&path).or_else(|_| Repository::open(&path)).map_err(|_| {
-        format!("在 {path} 及其父目录中没有找到 Git 仓库")
-    })?;
+    // 参数名必须保持 path：前端 invoke 传的 key 就是 { path }。raw 只留作诊断用的原始入参
+    let raw = path.clone();
+    // 从资源管理器「复制文件地址」粘贴进来时可能带一对英文引号，先剥掉；
+    // \\?\ 长路径前缀 libgit2 也能吃，但统一去掉更稳妥
+    let path = path.trim().trim_matches('"').trim().to_string();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path).to_string();
+
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("路径不存在：{path}"));
+    }
+
+    let repo = match try_open_repo(&path) {
+        Ok(r) => r,
+        Err((e1, e2)) => {
+            // 真实原因一定要带出去：libgit2 的报错（权限/所有权/找不到 .git 等）各不相同，
+            // 只回一句「没找到 Git 仓库」根本没法排查
+            let detail = format!("discover: {}；open: {}", e1.message(), e2.message());
+            // 同时打到后台终端，跑 pnpm tauri dev 时不用再开前端控制台
+            eprintln!("[open_repo] 打开失败 path={path} raw={raw} -> {detail}");
+
+            // 目录归属与当前用户不一致时 libgit2 会直接拒绝打开（Owner 类错误，等价 git 的
+            // "dubious ownership"）。本地工具没必要拦这一层，关掉校验重试一次。
+            let retried = if e1.code() == ErrorCode::Owner || e2.code() == ErrorCode::Owner {
+                unsafe { let _ = opts::set_verify_owner_validation(false); }
+                let r = try_open_repo(&path).ok();
+                unsafe { let _ = opts::set_verify_owner_validation(true); }
+                r
+            } else {
+                None
+            };
+
+            match retried {
+                Some(r) => {
+                    eprintln!("[open_repo] 关闭所有权校验后成功打开：{path}");
+                    r
+                }
+                None => {
+                    return Err(format!("在 {path} 及其父目录中没有找到 Git 仓库（{detail}）"));
+                }
+            }
+        }
+    };
 
     // 真实仓库根（去掉结尾分隔符），裸库回退到 .git 的父目录
     let root = repo
