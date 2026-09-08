@@ -966,6 +966,14 @@ fn git_remote_op(
         if let Some(b) = branch_name {
             args.push(b);
         }
+        // git 2.27+ 在分支分叉且未配置 pull.rebase / pull.ff 时会直接 fatal:
+        // "Need to specify how to reconcile divergent branches"，连合并都不会做。
+        // 这里显式走 merge：不依赖用户 config，且冲突一次性写入 index（→「冲突」列表）；
+        // rebase 会逐个 commit 重放，同一个文件可能反复冲突多轮，不适合 GUI 流程。
+        // 注意：能快进时依然是 fast-forward，只有真分叉才会生成 merge commit。
+        if op == "pull" {
+            args.push("--no-rebase".to_string());
+        }
 
         let out = std::process::Command::new("git")
             .args(&args)
