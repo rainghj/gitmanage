@@ -1408,6 +1408,8 @@ function App() {
   const [renameValue, setRenameValue] = useState("");
   // Stash 区默认折叠（低频功能），点标题展开
   const [stashOpen, setStashOpen] = useState(false);
+  // 中栏 tab 右键菜单（关闭当前/其他/左侧/右侧/全部，IDEA 风格）
+  const [tabCtx, setTabCtx] = useState<{ x: number; y: number; index: number } | null>(null);
   // 「不提交」区默认展开，点标题可折叠；列表高度限制为约一半，超出动条
   const [skipOpen, setSkipOpen] = useState(true);
   // 文件标签：默认高亮预览，点「编辑」才切到可编辑文本框
@@ -1476,6 +1478,51 @@ function App() {
     } else if (activeTab > i) {
       setActiveTab(activeTab - 1);
     }
+  }
+
+  // 右键菜单「关闭其他」：保留 keepIdx 自身 + 所有首页签；其余非首页签一并关掉
+  function closeOtherTabs(keepIdx: number) {
+    const keep = tabs.filter((_, j) => j === keepIdx || tabs[j]?.kind === "history");
+    setTabs(keep.length ? keep : [{ kind: "history" }]);
+    // keepIdx 在新数组里的位置 = 原索引减去「左侧被过滤掉的非首页签数」
+    let removedBefore = 0;
+    for (let j = 0; j < keepIdx; j++) {
+      if (tabs[j]?.kind !== "history") removedBefore++;
+    }
+    setActiveTab(keepIdx - removedBefore);
+  }
+
+  // 右键菜单「关闭左侧」：关掉 idx 左侧所有非首页签
+  function closeLeftTabs(idx: number) {
+    const remove = new Set<number>();
+    for (let j = 0; j < idx; j++) {
+      if (tabs[j]?.kind !== "history") remove.add(j);
+    }
+    if (remove.size === 0) return;
+    const next = tabs.filter((_, j) => !remove.has(j));
+    setTabs(next);
+    // 激活 tab 在 idx：左移 remove.size 位
+    setActiveTab(Math.max(0, idx - remove.size));
+  }
+
+  // 右键菜单「关闭右侧」：关掉 idx 右侧所有非首页签
+  function closeRightTabs(idx: number) {
+    const remove = new Set<number>();
+    for (let j = idx + 1; j < tabs.length; j++) {
+      if (tabs[j]?.kind !== "history") remove.add(j);
+    }
+    if (remove.size === 0) return;
+    const next = tabs.filter((_, j) => !remove.has(j));
+    setTabs(next);
+    // 激活 tab 在 idx：右侧被关不影响自身位置，但要确保不越界
+    setActiveTab(Math.min(idx, next.length - 1));
+  }
+
+  // 右键菜单「全部关闭」：仅保留首页签
+  function closeAllTabs() {
+    const keep = tabs.filter((t) => t.kind === "history");
+    setTabs(keep.length ? keep : [{ kind: "history" }]);
+    setActiveTab(0);
   }
 
   const activeT = tabs[activeTab] ?? tabs[0];
@@ -2519,6 +2566,12 @@ function App() {
                   className={`center-tab ${i === activeTab ? "active" : ""}`}
                   title={t.kind === "history" ? "提交历史" : t.path}
                   onClick={() => setActiveTab(i)}
+                  onContextMenu={(e) => {
+                    // 右键 = 先把该 tab 设为激活（IDEA 行为），再弹出关闭菜单
+                    e.preventDefault();
+                    setActiveTab(i);
+                    setTabCtx({ x: e.clientX, y: e.clientY, index: i });
+                  }}
                 >
                   {isDirty(t) && <span className="tab-dirty">●</span>}
                   <span className="center-tab-label">{tabLabel(t)}</span>
@@ -2947,6 +3000,86 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* 中栏 tab 右键菜单：关闭当前 / 关闭其他 / 关闭左侧 / 关闭右侧 / 全部关闭
+          复用 .ctx-overlay + .ctx-menu + .recent-menu-item 模板，按可用性 disabled 灰显 */}
+          {tabCtx && (() => {
+            const i = tabCtx.index;
+            const t = tabs[i];
+            const isHistory = !t || t.kind === "history";
+            const hasOther = tabs.some((tt, j) => j !== i && tt.kind !== "history");
+            const hasLeft = tabs.slice(0, i).some((tt) => tt.kind !== "history");
+            const hasRight = tabs.slice(i + 1).some((tt) => tt.kind !== "history");
+            const hasAny = tabs.some((tt) => tt.kind !== "history");
+            return (
+              <div
+                className="ctx-overlay"
+                onClick={() => setTabCtx(null)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setTabCtx(null);
+                }}
+              >
+                <div
+                  className="ctx-menu tab-ctx-menu"
+                  style={{ left: tabCtx.x, top: tabCtx.y }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    className="recent-menu-item"
+                    disabled={isHistory}
+                    title={isHistory ? "首页签不可关闭" : "关闭当前 tab"}
+                    onClick={() => {
+                      closeTab(i);
+                      setTabCtx(null);
+                    }}
+                  >
+                    关闭当前
+                  </button>
+                  <button
+                    className="recent-menu-item"
+                    disabled={!hasOther}
+                    onClick={() => {
+                      closeOtherTabs(i);
+                      setTabCtx(null);
+                    }}
+                  >
+                    关闭其他
+                  </button>
+                  <button
+                    className="recent-menu-item"
+                    disabled={!hasLeft}
+                    onClick={() => {
+                      closeLeftTabs(i);
+                      setTabCtx(null);
+                    }}
+                  >
+                    关闭左侧
+                  </button>
+                  <button
+                    className="recent-menu-item"
+                    disabled={!hasRight}
+                    onClick={() => {
+                      closeRightTabs(i);
+                      setTabCtx(null);
+                    }}
+                  >
+                    关闭右侧
+                  </button>
+                  <button
+                    className="recent-menu-item"
+                    disabled={!hasAny}
+                    onClick={() => {
+                      closeAllTabs();
+                      setTabCtx(null);
+                    }}
+                  >
+                    全部关闭
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
 
       {/* 提交历史右键菜单 */}
       {commitCtx && (

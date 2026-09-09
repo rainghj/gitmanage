@@ -1078,6 +1078,24 @@ button.ghost.small {
   color: var(--red);
 }
 
+/* 右键菜单里的禁用项（按 IDEA 风格灰显，悬停不再变色） */
+.recent-menu-item:disabled,
+.recent-menu-item.disabled {
+  color: var(--text-dim);
+  opacity: 0.55;
+  cursor: default;
+}
+.recent-menu-item:disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
+}
+
+/* tab 右键菜单：比通用 ctx-menu 稍窄，五个短文本项不需要 220px */
+.tab-ctx-menu {
+  min-width: 140px;
+  font-size: 12px;
+}
+
 /* 「放弃更改」确认弹窗 */
 .confirm-box {
   width: min(420px, 90vw);
