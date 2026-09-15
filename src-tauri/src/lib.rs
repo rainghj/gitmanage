@@ -704,21 +704,83 @@ fn checkout_branch(state: tauri::State<AppState>, name: String) -> Result<(), St
     })
 }
 
+/// 新建本地分支并（可选）切换过去。
+///
+/// - `from` 省略 = 起点取当前 HEAD（原来的行为）；给了就按 ref 解析，例如 `origin/202607-v5`。
+///   等价 `git branch <name> <from>`。
+/// - `track` = 让新分支跟踪 `from`。等价 `git checkout -b <name> --track <from>`
+///   （`--track` 隐含从 <from> 建分支）。只有 `from` 是**已存在的远程跟踪分支**才成立。
+///
+/// 校验全部前置到建分支之前：否则中途报错会在仓库里留一个半成品分支（建了但没跟踪、也没切过去）。
+fn create_branch_impl(
+    repo: &Repository,
+    name: &str,
+    checkout: bool,
+    from: Option<&str>,
+    track: bool,
+) -> Result<(), String> {
+    let start_ref = from.map(str::trim).filter(|s| !s.is_empty());
+
+    // set_upstream 认的是短名（"origin/main"）；调用方可能传 refs/remotes/... 或 remotes/...
+    let upstream_short = if track {
+        let Some(r) = start_ref else {
+            return Err("跟踪远程分支必须同时指定 from（起点）".to_string());
+        };
+        let short = r
+            .trim_start_matches("refs/remotes/")
+            .trim_start_matches("remotes/")
+            .to_string();
+        // 远程跟踪分支必须先存在（fetch 过）。否则 set_upstream 只会报一句看不懂的错，
+        // 这里提前换成能照着做的提示（和 set_upstream_impl 的策略一致）
+        if repo.find_branch(&short, BranchType::Remote).is_err() {
+            return Err(format!(
+                "{short} 不是本仓库已知的远程跟踪分支。先 fetch 一次再试（git fetch）"
+            ));
+        }
+        Some(short)
+    } else {
+        None
+    };
+
+    if repo.find_branch(name, BranchType::Local).is_ok() {
+        return Err(format!("本地已存在分支 {name}"));
+    }
+
+    let start = match start_ref {
+        Some(r) => repo
+            .revparse_single(r)
+            .map_err(to_err)?
+            .peel_to_commit()
+            .map_err(to_err)?,
+        None => repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?,
+    };
+    repo.branch(name, &start, false).map_err(to_err)?;
+
+    if let Some(short) = upstream_short.as_deref() {
+        let mut lb = repo.find_branch(name, BranchType::Local).map_err(to_err)?;
+        lb.set_upstream(Some(short)).map_err(to_err)?;
+    }
+
+    if checkout {
+        let obj = repo
+            .revparse_single(&format!("refs/heads/{name}"))
+            .map_err(to_err)?;
+        repo.checkout_tree(&obj, None).map_err(to_err)?;
+        repo.set_head(&format!("refs/heads/{name}")).map_err(to_err)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn create_branch(
     state: tauri::State<AppState>,
     name: String,
     checkout: bool,
+    from: Option<String>,
+    track: Option<bool>,
 ) -> Result<(), String> {
     with_repo!(state, repo, {
-        let head = repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?;
-        repo.branch(&name, &head, false).map_err(to_err)?;
-        if checkout {
-            let obj = repo.revparse_single(&format!("refs/heads/{name}")).map_err(to_err)?;
-            repo.checkout_tree(&obj, None).map_err(to_err)?;
-            repo.set_head(&format!("refs/heads/{name}")).map_err(to_err)?;
-        }
-        Ok(())
+        create_branch_impl(repo, &name, checkout, from.as_deref(), track.unwrap_or(false))
     })
 }
 
@@ -1548,6 +1610,80 @@ mod tests {
             // 上游 ref 不存在 → 报错要能照着做
             let err = set_upstream_impl(&repo, "feature/login", Some("origin/nope")).unwrap_err();
             assert!(err.contains("fetch"), "错误提示应引导先 fetch：{err}");
+        }
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// 从远程跟踪分支建本地分支（等价 git checkout -b <name> --track origin/<x>）。
+    /// 这是「点击远程分支 = 检出为本地分支」的后端路径。
+    #[test]
+    fn create_branch_from_remote() {
+        let dir = make_repo_with_remote("fromremote");
+
+        {
+            let repo = Repository::open(&dir).unwrap();
+
+            // 1) 指定起点 + 跟踪，但不切换：HEAD 仍留在 main
+            create_branch_impl(&repo, "feat", false, Some("origin/main"), true).unwrap();
+            let tip = repo
+                .find_branch("feat", BranchType::Local)
+                .unwrap()
+                .get()
+                .target()
+                .unwrap();
+            let remote_tip = repo
+                .find_branch("origin/main", BranchType::Remote)
+                .unwrap()
+                .get()
+                .target()
+                .unwrap();
+            assert_eq!(tip, remote_tip, "起点应为 origin/main");
+            assert_eq!(
+                repo.head().unwrap().shorthand(),
+                Some("main"),
+                "checkout=false 不该切走 HEAD"
+            );
+            assert_eq!(
+                repo.find_branch("feat", BranchType::Local)
+                    .unwrap()
+                    .upstream()
+                    .unwrap()
+                    .name()
+                    .unwrap(),
+                Some("origin/main"),
+                "track=true 应建立跟踪关系"
+            );
+
+            // 2) checkout=true 会切过去
+            create_branch_impl(&repo, "feat2", true, Some("origin/main"), true).unwrap();
+            assert_eq!(repo.head().unwrap().shorthand(), Some("feat2"));
+
+            // 3) 重名：提前拒绝
+            let err =
+                create_branch_impl(&repo, "feat", false, Some("origin/main"), true).unwrap_err();
+            assert!(err.contains("已存在"), "重名提示：{err}");
+
+            // 4) track 但没给起点
+            let err = create_branch_impl(&repo, "feat3", false, None, true).unwrap_err();
+            assert!(err.contains("from"), "缺起点提示：{err}");
+
+            // 5) from 不是远程跟踪分支 → 引导 fetch，且**不留半成品分支**
+            let err =
+                create_branch_impl(&repo, "feat4", false, Some("origin/nope"), true).unwrap_err();
+            assert!(err.contains("fetch"), "该引导 fetch：{err}");
+            assert!(
+                repo.find_branch("feat4", BranchType::Local).is_err(),
+                "校验失败时不该建出分支"
+            );
+
+            // 6) 不带 track 时传远程起点也允许（纯建分支，不建立跟踪）
+            create_branch_impl(&repo, "feat5", false, Some("origin/main"), false).unwrap();
+            assert!(repo
+                .find_branch("feat5", BranchType::Local)
+                .unwrap()
+                .upstream()
+                .is_err());
         }
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
