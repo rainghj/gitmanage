@@ -1241,6 +1241,34 @@ function usePersistentNumber(key: string, def: number): [number, (v: number) => 
   return [v, set];
 }
 
+/** 分支树里「被收起」的分组 id 集合。
+ *
+ *  存**收起集合**而不是展开集合：以后新增分组默认就是展开的，只有用户明确点过的才保持收起
+ *  ——反过来会出现「新分组一上线就是隐藏状态，而用户根本不知道它存在」。
+ *  换仓库也沿用（这是个人浏览习惯，不是仓库属性）。 */
+function usePersistentFolded(key: string, def: string[] = []): [Set<string>, (id: string) => void] {
+  const [v, setV] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      const arr = raw ? JSON.parse(raw) : null;
+      return Array.isArray(arr) ? new Set(arr as string[]) : new Set(def);
+    } catch {
+      return new Set(def);
+    }
+  });
+  const toggle = (id: string) =>
+    setV((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify([...v]));
+  }, [key, v]);
+  return [v, toggle];
+}
+
 /** 通用拖拽：pointerdown + setPointerCapture 把事件捕获到元素自身
  * （比 window mousemove 在 WebView2 里更可靠），期间锁定光标与文本选中 */
 function startDrag(e: React.PointerEvent<HTMLElement>, cursor: string, onMove: (ev: PointerEvent) => void) {
@@ -1427,7 +1455,17 @@ function App() {
   // 提交历史右键菜单（复制 hash / 提交信息）
   const [commitCtx, setCommitCtx] = useState<{ x: number; y: number; oid: string; summary: string } | null>(null);
   // 分支树右键菜单 + 重命名弹窗
-  const [branchCtx, setBranchCtx] = useState<{ x: number; y: number; name: string } | null>(null);
+  // 分支树分组折叠。默认只收起「其他远程」：远程分支一多会把下面的「更改」区挤到看不见。
+  // id 见分支树渲染处：local / remoteTracked / remoteRest
+  const [foldedGroups, toggleGroup] = usePersistentFolded("gitmanage.branchFolded", ["remoteRest"]);
+  // 分支树过滤词。折叠只解决「占地方」，182 个远程分支里想找具体某一条还得靠过滤
+  const [branchFilter, setBranchFilter] = useState("");
+  const [branchCtx, setBranchCtx] = useState<{
+    x: number;
+    y: number;
+    name: string;
+    isRemote: boolean;
+  } | null>(null);
   const [renameTarget, setRenameTarget] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   // Stash 区默认折叠（低频功能），点标题展开
@@ -1786,15 +1824,92 @@ function App() {
     const name = window.prompt("新分支名（基于当前 HEAD 创建并切换）：");
     if (!name?.trim()) return;
     try {
-      await invoke("create_branch", { name: name.trim(), checkout: true });
+      await invoke("create_branch", {
+        name: name.trim(),
+        checkout: true,
+        from: null,
+        track: false,
+      });
       await refresh();
     } catch (e) {
       setError(String(e));
     }
   }
 
+  // 检出远程分支：新建一个本地分支、切过去、并建立跟踪关系。
+  // 等价 git checkout -b <本地名> --track <远程名>（纯本地操作，不联网）。
+  //
+  // 本地已有同名分支时**不重复创建**，直接切过去（等价 git checkout <短名> 的老习惯）：
+  // 否则会撞上「本地 master」和「从 origin/master 检出的 master」重名，还不如顺手切过去。
+  async function checkoutRemote(full: string) {
+    const i = full.indexOf("/");
+    const short = i >= 0 ? full.slice(i + 1) : full;
+    if (localBranches.some((b) => b.name === short)) {
+      await checkoutBranch(short);
+      return;
+    }
+    const name = window.prompt(
+      `检出 ${full} 为新的本地分支并切换（会建立跟踪关系）：`,
+      short,
+    );
+    if (!name?.trim()) return;
+    try {
+      await invoke("create_branch", {
+        name: name.trim(),
+        checkout: true,
+        from: full,
+        track: true,
+      });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // 本地分支行。删除**不在行尾**（原来悬停出现的 × 紧挨着「点击切换分支」的整行热区，误触就删），
+  // 只在右键菜单里给，所以这里没有行尾按钮。
+  function localRow(b: BranchInfo) {
+    return (
+      <div
+        key={b.name}
+        className={`branch-tree-item ${b.isHead ? "current" : "clickable"}`}
+        title={`${b.isHead ? "当前分支" : `点击切换到 ${b.name}`} · ${
+          b.upstream ? `跟踪 ${b.upstream}` : "未绑定远程分支"
+        }（右键：绑定 / 重命名 / 删除）`}
+        onClick={() => !b.isHead && checkoutBranch(b.name)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setBranchCtx({ x: e.clientX, y: e.clientY, name: b.name, isRemote: false });
+        }}
+      >
+        <span className="branch-tree-name">⎇ {b.name}</span>
+      </div>
+    );
+  }
+
+  // 远程分支行。折叠起来之后这行更需要能操作，所以点击 = 检出为本地分支，
+  // 右键给同款入口 + 复制分支名。
+  function remoteRow(b: BranchInfo) {
+    return (
+      <div
+        key={b.name}
+        className="branch-tree-item remote clickable"
+        title={`${b.name} · 点击检出为本地分支并建立跟踪（右键更多操作）`}
+        onClick={() => checkoutRemote(b.name)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setBranchCtx({ x: e.clientX, y: e.clientY, name: b.name, isRemote: true });
+        }}
+      >
+        <span className="branch-tree-name">☁ {b.name}</span>
+      </div>
+    );
+  }
+
   async function deleteBranch(name: string) {
-    if (!confirm(`删除分支 ${name}？未合并的分支会被拒绝。`)) return;
+    if (!confirm(`删除分支 ${name}？\n\n等价 git branch -d ${name}：未合并的分支会被拒绝，要强删得用 git branch -D。`)) {
+      return;
+    }
     try {
       await invoke("delete_branch", { name, force: false });
       await refresh();
@@ -2048,10 +2163,48 @@ function App() {
 
   const { rows: graphRows, laneCount } = useMemo(() => computeGraph(commits), [commits]);
   const localBranches = branches.filter((b) => !b.isRemote);
-  const remoteBranches = branches.filter((b) => b.isRemote);
-  // 可当上游的候选：排除 origin/HEAD 这类**符号引用**。它只是指向默认分支的别名
-  // （远端默认分支一改它就漂），绑上去等于绑了个假上游；也把它排除出「默认预选」。
-  const bindCandidates = remoteBranches.filter((b) => !b.name.endsWith("/HEAD"));
+  // 排除 origin/HEAD 这类**符号引用**：它只是「远端默认分支」的别名（远端一改默认分支它就漂），
+  // 点它等于检出一个叫 HEAD 的本地分支，纯属噪音。它同时也不该是上游候选/过滤项，见下。
+  const remoteBranches = branches.filter((b) => b.isRemote && !b.name.endsWith("/HEAD"));
+  // 可当上游的候选就是上面这批（已排除 origin/HEAD 这类符号引用）：绑上去等于绑了个会漂的假上游
+  const bindCandidates = remoteBranches;
+  // 远程再分两档：本地分支**已经在跟踪**的露在外面（那才是常用的那几个），其余收进折叠档。
+  // 依据是本地分支的 upstream 集合 —— 真正在用的远程分支必然出现在这里，不用猜。
+  // （上游给的是 origin/main 这种短名，和远程分支列表里的 name 同格式，可以直接比）
+  const trackedRemoteNames = new Set(
+    localBranches.map((b) => b.upstream).filter((u): u is string => !!u),
+  );
+  const remoteTracked = remoteBranches.filter((b) => trackedRemoteNames.has(b.name));
+  const remoteRest = remoteBranches.filter((b) => !trackedRemoteNames.has(b.name));
+
+  // ---------- 分支树过滤 ----------
+  // 本地和远程一起匹配，且按全名匹配 → 输入 deploy 和 origin/deploy 都能命中。
+  const bf = branchFilter.trim().toLowerCase();
+  const filtering = bf.length > 0;
+  const hit = (n: string) => n.toLowerCase().includes(bf);
+  const localShown = filtering ? localBranches.filter((b) => hit(b.name)) : localBranches;
+  const trackedShown = filtering ? remoteTracked.filter((b) => hit(b.name)) : remoteTracked;
+  const restShown = filtering ? remoteRest.filter((b) => hit(b.name)) : remoteRest;
+  const noHit =
+    filtering && localShown.length + trackedShown.length + restShown.length === 0;
+
+  // 有过滤词时强制展开：否则「其他远程」里的命中项会被折叠藏起来，等于白输。
+  const expanded = (id: string) => filtering || !foldedGroups.has(id);
+
+  // 分组头：可点折叠 + 计数。过滤时计数显示「命中/总数」，让人知道列表确实被筛过了。
+  function groupHead(id: string, label: string, shownLen: number, total: number) {
+    return (
+      <button
+        className="branch-tree-group clickable"
+        title={`${expanded(id) ? "收起" : "展开"}${label}`}
+        onClick={() => toggleGroup(id)}
+      >
+        <span className="branch-tree-caret">{expanded(id) ? "▾" : "▸"}</span>
+        {label}
+        <span className="branch-tree-count">{filtering ? `${shownLen}/${total}` : total}</span>
+      </button>
+    );
+  }
   // 顶栏的"当前分支"：必须以 list_branches 为准。repo.currentBranch 只是**打开仓库那一刻的快照**
   // ——refresh() 不重拉 RepoSummary，所以切换/新建分支后它会一直是旧分支名（顶栏显示错的本地分支，
   // 点琥珀色徽标还会拿旧名字去绑定）。只有分离 HEAD 等拿不到具名分支时才回退到那个快照。
@@ -2406,7 +2559,7 @@ function App() {
                 冲突{conflicts.length > 0 ? `（${conflicts.length}）` : ""}
               </button>
             </div>
-            <div className="pane-body">
+            <div className="pane-body left-top">
               {leftTab === "conflicts" ? (
                 <div className="conflict-tree">
                   <div className="conflict-head">
@@ -2471,43 +2624,53 @@ function App() {
                 )
               ) : (
                 <div className="branch-tree">
-                  <div className="branch-tree-group">本地</div>
-                  {localBranches.map((b) => (
-                    <div
-                      key={b.name}
-                      className={`branch-tree-item ${b.isHead ? "current" : "clickable"}`}
-                      title={`${b.isHead ? "当前分支" : `点击切换到 ${b.name}`} · ${
-                        b.upstream ? `跟踪 ${b.upstream}` : "未绑定远程分支"
-                      }（右键更多操作）`}
-                      onClick={() => !b.isHead && checkoutBranch(b.name)}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        setBranchCtx({ x: e.clientX, y: e.clientY, name: b.name });
+                  {/* 过滤框 sticky 在上区顶部：182 个远程分支展开后要在上区里滚动，
+                      框不能跟着滚走，否则想改关键词还得先滚回顶部 */}
+                  <div className="branch-filter">
+                    <input
+                      type="search"
+                      placeholder="过滤分支名（本地 + 远程）…"
+                      value={branchFilter}
+                      onChange={(e) => setBranchFilter(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setBranchFilter("");
                       }}
-                    >
-                      <span className="branch-tree-name">⎇ {b.name}</span>
-                      {!b.isHead && (
-                        <button
-                          className="chip-x"
-                          title="删除分支"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            deleteBranch(b.name);
-                          }}
-                        >
-                          ×
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                  {remoteBranches.length > 0 && (
-                    <div className="branch-tree-group">远程</div>
+                    />
+                  </div>
+                  {noHit && <div className="empty-hint">没有匹配的分支</div>}
+                  {/* 分组头可点折叠：远程分支一多就平铺成长列表，把下面的「更改」区挤到看不见。
+                      计数徽标即使收起也能看到里面有多少条，不会收起来就忘了它存在。
+                      过滤时只留命中的分组，且统统强制展开（见 expanded）。 */}
+                  {(!filtering || localShown.length > 0) && (
+                    <>
+                      {groupHead("local", "本地", localShown.length, localBranches.length)}
+                      {expanded("local") && localShown.map(localRow)}
+                    </>
                   )}
-                  {remoteBranches.map((b) => (
-                    <div key={b.name} className="branch-tree-item remote">
-                      <span className="branch-tree-name">☁ {b.name}</span>
-                    </div>
-                  ))}
+                  {remoteTracked.length > 0 && (!filtering || trackedShown.length > 0) && (
+                    <>
+                      {groupHead(
+                        "remoteTracked",
+                        "已绑定",
+                        trackedShown.length,
+                        remoteTracked.length,
+                      )}
+                      {expanded("remoteTracked") && trackedShown.map(remoteRow)}
+                    </>
+                  )}
+                  {remoteRest.length > 0 && (!filtering || restShown.length > 0) && (
+                    <>
+                      {/* 没有任何本地分支绑定上游时「已绑定」那一档不会出现，
+                          此时这档就是全部远程分支，标题直接叫「远程」更直白 */}
+                      {groupHead(
+                        "remoteRest",
+                        remoteTracked.length > 0 ? "其他远程" : "远程",
+                        restShown.length,
+                        remoteRest.length,
+                      )}
+                      {expanded("remoteRest") && restShown.map(remoteRow)}
+                    </>
+                  )}
                   <button
                     className="branch-tree-add"
                     title="基于 HEAD 新建分支并切换"
@@ -3285,30 +3448,73 @@ function App() {
             style={{ left: branchCtx.x, top: branchCtx.y }}
             onClick={(e) => e.stopPropagation()}
           >
-            {/* 上游绑定：已绑定给「解除绑定」，未绑定给「绑定远程分支…」——一个位置只放当前该做的那件事 */}
-            {(() => {
-              const b = localBranches.find((x) => x.name === branchCtx.name);
-              return b?.upstream ? (
+            {branchCtx.isRemote ? (
+              // 远程分支：只有「检出成自己的分支」和「复制名字」两件事可做。
+              // 绑定/解绑/重命名都是**本地分支**的动作，摆在远程行上只会让人点错。
+              <button
+                className="recent-menu-item"
+                title={`新建本地分支并切换、建立跟踪关系。等价 git checkout -b <本地名> --track ${branchCtx.name}`}
+                onClick={() => {
+                  const n = branchCtx.name;
+                  setBranchCtx(null);
+                  checkoutRemote(n);
+                }}
+              >
+                ⎇ 检出为本地分支…
+              </button>
+            ) : (
+              <>
+                {/* 上游绑定：已绑定给「解除绑定」，未绑定给「绑定远程分支…」——一个位置只放当前该做的那件事 */}
+                {(() => {
+                  const b = localBranches.find((x) => x.name === branchCtx.name);
+                  return b?.upstream ? (
+                    <button
+                      className="recent-menu-item"
+                      title={`解绑后 push/pull 不再知道往哪儿推：git branch --unset-upstream ${branchCtx.name}`}
+                      onClick={() => {
+                        doUnbind(branchCtx.name);
+                        setBranchCtx(null);
+                      }}
+                    >
+                      ⇄ 解除绑定（跟踪 {b.upstream}）
+                    </button>
+                  ) : (
+                    <button
+                      className="recent-menu-item"
+                      title="只改本地配置，不 fetch、不推送"
+                      onClick={() => openBindDialog(branchCtx.name)}
+                    >
+                      ⇄ 绑定远程分支…
+                    </button>
+                  );
+                })()}
                 <button
                   className="recent-menu-item"
-                  title={`解绑后 push/pull 不再知道往哪儿推：git branch --unset-upstream ${branchCtx.name}`}
                   onClick={() => {
-                    doUnbind(branchCtx.name);
+                    setRenameTarget(branchCtx.name);
+                    setRenameValue(branchCtx.name);
                     setBranchCtx(null);
                   }}
                 >
-                  ⇄ 解除绑定（跟踪 {b.upstream}）
+                  ✎ 重命名分支…
                 </button>
-              ) : (
-                <button
-                  className="recent-menu-item"
-                  title="只改本地配置，不 fetch、不推送"
-                  onClick={() => openBindDialog(branchCtx.name)}
-                >
-                  ⇄ 绑定远程分支…
-                </button>
-              );
-            })()}
+                {/* 删除只放右键：原来悬停行尾的 × 紧挨着「点击切换分支」，滑过就点，是误触源。
+                    当前分支不给这一项（后端也会拒），不显示比点了报错好。危险项放最后 + 悬停变红。 */}
+                {!localBranches.find((x) => x.name === branchCtx.name)?.isHead && (
+                  <button
+                    className="recent-menu-item danger"
+                    title={`等价 git branch -d ${branchCtx.name}：未合并的分支会被拒绝，强删需 git branch -D`}
+                    onClick={() => {
+                      const n = branchCtx.name;
+                      setBranchCtx(null);
+                      deleteBranch(n);
+                    }}
+                  >
+                    × 删除分支…
+                  </button>
+                )}
+              </>
+            )}
             <button
               className="recent-menu-item"
               onClick={async () => {
@@ -3321,16 +3527,6 @@ function App() {
               }}
             >
               ⧉ 复制分支名
-            </button>
-            <button
-              className="recent-menu-item"
-              onClick={() => {
-                setRenameTarget(branchCtx.name);
-                setRenameValue(branchCtx.name);
-                setBranchCtx(null);
-              }}
-            >
-              ✎ 重命名分支…
             </button>
           </div>
         </div>

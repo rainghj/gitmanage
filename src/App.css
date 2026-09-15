@@ -567,6 +567,14 @@ button.link {
   flex: 1;
 }
 
+/* 左栏上区（分支树 / 文件树 / 冲突）：内容少时自然矮、把高度让给下面的「更改」区，
+   但封顶在 55% —— 远程分支多起来时，平铺的长列表会把「更改」列表和提交框整个挤出视野。
+   超出部分在上区自己内部滚动（.pane-body 本身就是 overflow:auto）。 */
+.left > .pane-body.left-top {
+  flex: 0 1 auto;
+  max-height: 55%;
+}
+
 /* ---------- 文件树 ---------- */
 
 .file-tree {
@@ -657,12 +665,71 @@ button.link {
 
 /* ---------- 分支树（IDEA 风格，本地/远程分组） ---------- */
 
+/* 过滤框 sticky 在上区顶部：远程分支展开后要在这块里滚动，框不能跟着滚走，
+   否则想改关键词还得先滚回顶部。底色必须显式给，不然滚动时列表会从框下面透上来。 */
+.branch-filter {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 10px 4px;
+  background: var(--bg);
+}
+
+.branch-filter input {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 3px 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.branch-filter input:focus {
+  border-color: var(--accent-2);
+}
+
+/* 分组头是个 <button>（可点折叠），所以先把全局 button 的蓝底白字洗掉 */
 .branch-tree-group {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
   padding: 6px 10px 3px;
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-dim);
+  background: none;
+  border: none;
+  border-radius: 0;
+  text-align: left;
+}
+
+.branch-tree-group.clickable:hover {
+  color: var(--text);
+  filter: none; /* 盖掉全局 button:hover 的 brightness，透明底上只会把文字蹭亮 */
+}
+
+/* 箭头定宽：展开/收起时标题不左右抖动 */
+.branch-tree-caret {
+  flex-shrink: 0;
+  width: 9px;
+  font-size: 10px;
+}
+
+/* 条数徽标：分组收起后，靠它才知道里面还剩多少条 */
+.branch-tree-count {
+  margin-left: auto;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-dim);
+  background: var(--panel-2);
+  border-radius: 8px;
 }
 
 .branch-tree-item {
@@ -689,9 +756,15 @@ button.link {
   font-weight: 600;
 }
 
+/* 远程分支行可点（检出为本地分支）。保持暗色，别抢当前分支的强调色 */
 .branch-tree-item.remote {
   color: var(--text-dim);
-  cursor: default;
+  cursor: pointer;
+}
+
+.branch-tree-item.remote:hover {
+  background: var(--panel-2);
+  color: var(--text);
 }
 
 .branch-tree-name {
