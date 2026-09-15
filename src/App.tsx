@@ -1472,6 +1472,7 @@ function App() {
       setSyncCounts(ab);
       setSkipList(sk);
       setConflicts(cf);
+      setRemotes(rm);
       // 已打开的文件/对比标签内容可能已过时，清空缓存让激活标签重拉
       setTabData({});
     } catch (e) {
@@ -1887,8 +1888,8 @@ function App() {
       // 绑定后再推一次。本地分支名和远程分支名可能不一样，必须显式给 refspec（本地:远程），
       // 否则 git 会把「当前分支」推成同名分支，跟刚绑上的上游对不上。
       const i = upstream.indexOf("/");
-      const remote = upstream.slice(0, i);
-      const remoteBranch = upstream.slice(i + 1);
+      const remote = i >= 0 ? upstream.slice(0, i) : "origin";
+      const remoteBranch = i >= 0 ? upstream.slice(i + 1) : upstream;
       const pushed = await runRemoteOp("push", remote, `${local}:${remoteBranch}`);
       setConsoleText(`> git branch -u ${upstream} ${local}\n${msg}\n\n${pushed}`);
       await refresh();
@@ -2857,11 +2858,17 @@ function App() {
                   className="ghost small"
                   onClick={() => doRemoteOp("push")}
                   disabled={opBusy !== null}
-                  title={
-                    syncCounts && syncCounts[0] > 0
+                  title={(() => {
+                    const cur = localBranches.find((b) => b.isHead);
+                    // 无上游时后端会自动改走 `git push --set-upstream`。先把话说清楚，
+                    // 免得用户以为只是普通推送，结果远程凭空多出一个同名分支
+                    if (cur && !cur.upstream) {
+                      return `当前分支未关联远程分支：将执行 git push --set-upstream origin ${cur.name}（推上去并建立绑定）`;
+                    }
+                    return syncCounts && syncCounts[0] > 0
                       ? `git push（当前分支）—— 本地领先 ${syncCounts[0]} 条`
-                      : "git push（当前分支）"
-                  }
+                      : "git push（当前分支）";
+                  })()}
                 >
                   {opBusy === "push" ? "…" : "↑ push"}
                   {!opBusy && syncCounts && syncCounts[0] > 0 && (
