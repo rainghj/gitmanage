@@ -1868,11 +1868,13 @@ function App() {
   function openBindDialog(local: string) {
     setBranchCtx(null);
     setBindTarget(local);
-    const exact = remoteBranches.find((b) => {
+    const exact = bindCandidates.find((b) => {
       const i = b.name.indexOf("/");
       return i >= 0 && b.name.slice(i + 1) === local;
     });
-    setBindUpstream(exact?.name ?? remoteBranches[0]?.name ?? "");
+    // 没找到同名远程分支就**一律不预选**：绑定决定 push/pull 的落点，
+    // 猜错（比如把新建分支默认指到 origin/main）一 push 就往主干上推，比少点一下严重得多
+    setBindUpstream(exact?.name ?? "");
   }
 
   async function doBindUpstream(local: string, upstream: string, thenPush: boolean) {
@@ -2047,6 +2049,14 @@ function App() {
   const { rows: graphRows, laneCount } = useMemo(() => computeGraph(commits), [commits]);
   const localBranches = branches.filter((b) => !b.isRemote);
   const remoteBranches = branches.filter((b) => b.isRemote);
+  // 可当上游的候选：排除 origin/HEAD 这类**符号引用**。它只是指向默认分支的别名
+  // （远端默认分支一改它就漂），绑上去等于绑了个假上游；也把它排除出「默认预选」。
+  const bindCandidates = remoteBranches.filter((b) => !b.name.endsWith("/HEAD"));
+  // 顶栏的"当前分支"：必须以 list_branches 为准。repo.currentBranch 只是**打开仓库那一刻的快照**
+  // ——refresh() 不重拉 RepoSummary，所以切换/新建分支后它会一直是旧分支名（顶栏显示错的本地分支，
+  // 点琥珀色徽标还会拿旧名字去绑定）。只有分离 HEAD 等拿不到具名分支时才回退到那个快照。
+  const headBranch = localBranches.find((b) => b.isHead);
+  const headName = headBranch?.name ?? repo?.currentBranch;
   // 更改列表拆成两部分：不提交列表里的文件单独成区，不参与勾选提交
   const visibleStatus = status.filter((s) => !skipList.includes(s.path));
   const skippedStatus = status.filter((s) => skipList.includes(s.path));
@@ -2085,16 +2095,16 @@ function App() {
               title={`${repo.path}\n点击打开仓库菜单（切换 / 在资源管理器中打开 / 复制路径）`}
             >
               <span className="repo-widget-name">{repo.name}</span>
-              {repo.currentBranch && (
-                <span className="repo-widget-chip" title={`当前分支：${repo.currentBranch}`}>
+              {headName && (
+                <span className="repo-widget-chip" title={`当前分支：${headName}`}>
                   <BranchGlyph />
-                  {repo.currentBranch}
+                  {headName}
                 </span>
               )}
               {(() => {
                 // 当前分支的上游跟踪分支（origin/main → 显示为 main，与参考样式一致）。
                 // 远程名不一定是 origin，所以按第一个 "/" 切，而不是硬编码剥 7 个字符
-                const upstream = localBranches.find((b) => b.isHead)?.upstream;
+                const upstream = headBranch?.upstream;
                 if (upstream) {
                   const i = upstream.indexOf("/");
                   const short = i >= 0 ? upstream.slice(i + 1) : upstream;
@@ -2110,7 +2120,7 @@ function App() {
                 }
                 // 没有上游就必须显式说出来：以前这里直接 return null，
                 // 未绑定和已绑定在顶栏长得一模一样，用户只会觉得 push/pull 莫名其妙用不了
-                if (!repo.currentBranch) return null; // 空仓库 / 分离 HEAD，没有可绑的分支
+                if (!headName) return null; // 空仓库 / 分离 HEAD，没有可绑的分支
                 if (remotes.length === 0) {
                   return (
                     <>
@@ -2129,7 +2139,7 @@ function App() {
                     </>
                   );
                 }
-                const localName = repo.currentBranch;
+                const localName = headName;
                 return (
                   <>
                     <span className="repo-widget-sep">/</span>
@@ -3336,8 +3346,8 @@ function App() {
             <div className="confirm-path" title={bindTarget}>
               {bindTarget}
             </div>
-            {remoteBranches.length === 0 ? (
-              // 一个远程跟踪分支都没有：多半是没 fetch 过，绑定没有候选可选
+            {bindCandidates.length === 0 ? (
+              // 一个可绑的远程跟踪分支都没有：多半是没 fetch 过
               <div className="confirm-desc">
                 本地还没有任何远程跟踪分支（refs/remotes/*）。多数情况是还没抓取过远程——
                 先 fetch 一次，把远程分支拿到本地再来绑定。
@@ -3351,7 +3361,9 @@ function App() {
                     value={bindUpstream}
                     onChange={(e) => setBindUpstream(e.currentTarget.value)}
                   >
-                    {remoteBranches.map((b) => (
+                    {/* 没预选时留个空选项，逼用户明确指定上游（push 会推到它） */}
+                    <option value="">（请选择远程分支…）</option>
+                    {bindCandidates.map((b) => (
                       <option key={b.name} value={b.name}>
                         {b.name}
                       </option>
@@ -3359,13 +3371,14 @@ function App() {
                   </select>
                 </div>
                 <div className="confirm-desc">
-                  只写入 .git/config 的 branch.{bindTarget}.remote / .merge，
-                  不 fetch、不推送。之后 push / pull 就以它为上游。
+                  {bindUpstream
+                    ? `只写入 .git/config 的 branch.${bindTarget}.remote / .merge，不 fetch、不推送；之后 push / pull 以它为上游。`
+                    : "远程没有同名分支，所以没替你预选——手动选一个上游，之后 push 会推到它，别选错。"}
                 </div>
               </>
             )}
             <div className="confirm-actions">
-              {remoteBranches.length === 0 ? (
+              {bindCandidates.length === 0 ? (
                 <button
                   onClick={() => {
                     setBindTarget(null);
