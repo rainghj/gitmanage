@@ -1330,6 +1330,24 @@ function BranchGlyph({ remote = false }: { remote?: boolean }) {
   );
 }
 
+// 未绑定提示用的小图标（圈里一个叹号）。和 BranchGlyph 一样用 currentColor，跟着文字变色
+function WarnGlyph() {
+  return (
+    <svg
+      className="branch-glyph"
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle cx="8" cy="8" r="6.2" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M8 4.7v4.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <circle cx="8" cy="11.5" r="0.9" fill="currentColor" />
+    </svg>
+  );
+}
+
 // ---------- 通用小工具 ----------
 
 function useDebounced<T>(value: T, ms: number): T {
@@ -1386,6 +1404,12 @@ function App() {
   const [remoteUrl, setRemoteUrl] = useState("");
   // [ahead, behind]：待 push / 待 pull 条数；null = 无上游（纯本地仓库）不显示角标
   const [syncCounts, setSyncCounts] = useState<[number, number] | null>(null);
+  // 仓库已配置的远程名。用来区分顶栏该提示「未关联远程」（有远程、只是没绑）
+  // 还是「无远程」（连地址都没配）——两者的下一步完全不同
+  const [remotes, setRemotes] = useState<string[]>([]);
+  // 绑定远程分支弹层：bindTarget = 要绑的本地分支；bindUpstream = 选中的远程跟踪分支
+  const [bindTarget, setBindTarget] = useState<string | null>(null);
+  const [bindUpstream, setBindUpstream] = useState("");
   // 中栏标签页工作区
   const [tabs, setTabs] = useState<CenterTab[]>([{ kind: "history" }]);
   const [activeTab, setActiveTab] = useState(0);
@@ -1425,7 +1449,7 @@ function App() {
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st, s, ab, sk, cf] = await Promise.all([
+      const [bs, log, t, st, s, ab, sk, cf, rm] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: logLimit,
@@ -1438,6 +1462,7 @@ function App() {
         invoke<[number, number] | null>("get_ahead_behind"),
         invoke<string[]>("get_skip_list"),
         invoke<ConflictFile[]>("get_conflicts"),
+        invoke<string[]>("list_remotes"),
       ]);
       setBranches(bs);
       setCommits(log);
@@ -1833,6 +1858,56 @@ function App() {
     }
   }
 
+  // ---------- 上游分支绑定（等价 git branch -u / --unset-upstream） ----------
+  //
+  // 后端走 git2 原生 API，**只写 .git/config 的 branch.<名>.remote / .merge**：
+  // 不 fetch、不推送，也不需要先切到那个分支。本地名和远程名可以不同。
+
+  // 打开绑定弹层。默认预选同名远程分支（origin/<本地名>），省掉最常见的一次选择
+  function openBindDialog(local: string) {
+    setBranchCtx(null);
+    setBindTarget(local);
+    const exact = remoteBranches.find((b) => {
+      const i = b.name.indexOf("/");
+      return i >= 0 && b.name.slice(i + 1) === local;
+    });
+    setBindUpstream(exact?.name ?? remoteBranches[0]?.name ?? "");
+  }
+
+  async function doBindUpstream(local: string, upstream: string, thenPush: boolean) {
+    try {
+      const msg = await invoke<string>("set_branch_upstream", { local, upstream });
+      setBindTarget(null);
+      setConsoleOpen(true);
+      setConsoleText(`> git branch -u ${upstream} ${local}\n${msg}`);
+      if (!thenPush) {
+        await refresh();
+        return;
+      }
+      // 绑定后再推一次。本地分支名和远程分支名可能不一样，必须显式给 refspec（本地:远程），
+      // 否则 git 会把「当前分支」推成同名分支，跟刚绑上的上游对不上。
+      const i = upstream.indexOf("/");
+      const remote = upstream.slice(0, i);
+      const remoteBranch = upstream.slice(i + 1);
+      const pushed = await runRemoteOp("push", remote, `${local}:${remoteBranch}`);
+      setConsoleText(`> git branch -u ${upstream} ${local}\n${msg}\n\n${pushed}`);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function doUnbind(local: string) {
+    try {
+      const msg = await invoke<string>("set_branch_upstream", { local, upstream: null });
+      setConsoleText(`> git branch --unset-upstream ${local}\n${msg}`);
+      setConsoleOpen(true);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   // 放弃更改：已跟踪文件从索引还原，未跟踪文件直接删除（后端语义）
   async function discardFile(path: string) {
     try {
@@ -1847,26 +1922,34 @@ function App() {
     }
   }
 
-  async function doRemoteOp(op: "fetch" | "pull" | "push") {
+  // 底层：只调后端并把「等价命令行 + git 原始输出」拼成控制台文本，不碰任何 UI 状态。
+  // doRemoteOp（按钮）和「绑定并推送」共用；失败也原样返回文本——git 的原文最有诊断价值。
+  async function runRemoteOp(
+    op: "fetch" | "pull" | "push",
+    remote: string | null,
+    branch: string | null
+  ): Promise<string> {
+    // branch 对 push 而言是 refspec（可以是 "本地:远程"），直接拼进提示行便于用户照抄
+    const argv = `> git ${op}${remote ? ` ${remote}` : ""}${branch ? ` ${branch}` : ""}\n`;
+    try {
+      return argv + (await invoke<string>("git_remote_op", { op, remote, branch }));
+    } catch (e) {
+      return `${argv}${String(e)}`;
+    }
+  }
+
+  async function doRemoteOp(
+    op: "fetch" | "pull" | "push",
+    remote: string | null = null,
+    branch: string | null = null
+  ) {
     if (!repo) return;
     setOpBusy(op);
-    setConsoleText(`> git ${op}\n`);
     setConsoleOpen(true);
-    try {
-      const text = await invoke<string>("git_remote_op", {
-        op,
-        remote: null,
-        branch: null,
-      });
-      setConsoleText(`> git ${op}\n${text}`);
-      await refresh();
-    } catch (e) {
-      setConsoleText(`> git ${op} 失败\n${String(e)}`);
-      // pull 可能已把仓库带进合并冲突状态——无论成败都刷新，让「冲突」入口及时出现
-      await refresh();
-    } finally {
-      setOpBusy(null);
-    }
+    setConsoleText(await runRemoteOp(op, remote, branch));
+    setOpBusy(null);
+    // pull 可能已把仓库带进合并冲突状态——无论成败都刷新，让「冲突」入口及时出现
+    await refresh();
   }
 
   // 放弃合并/变基：git merge --abort / git rebase --abort（后端按仓库状态自动选）
@@ -2008,16 +2091,58 @@ function App() {
                 </span>
               )}
               {(() => {
-                // 当前分支的上游跟踪分支（origin/main → 显示为 main，与参考样式一致）
-                const upstream = branches.find((b) => !b.isRemote && b.isHead)?.upstream;
-                if (!upstream) return null;
-                const short = upstream.startsWith("origin/") ? upstream.slice(7) : upstream;
+                // 当前分支的上游跟踪分支（origin/main → 显示为 main，与参考样式一致）。
+                // 远程名不一定是 origin，所以按第一个 "/" 切，而不是硬编码剥 7 个字符
+                const upstream = localBranches.find((b) => b.isHead)?.upstream;
+                if (upstream) {
+                  const i = upstream.indexOf("/");
+                  const short = i >= 0 ? upstream.slice(i + 1) : upstream;
+                  return (
+                    <>
+                      <span className="repo-widget-sep">/</span>
+                      <span className="repo-widget-chip remote" title={`跟踪分支：${upstream}`}>
+                        <BranchGlyph remote />
+                        {short}
+                      </span>
+                    </>
+                  );
+                }
+                // 没有上游就必须显式说出来：以前这里直接 return null，
+                // 未绑定和已绑定在顶栏长得一模一样，用户只会觉得 push/pull 莫名其妙用不了
+                if (!repo.currentBranch) return null; // 空仓库 / 分离 HEAD，没有可绑的分支
+                if (remotes.length === 0) {
+                  return (
+                    <>
+                      <span className="repo-widget-sep">/</span>
+                      <span
+                        className="repo-widget-chip unbound"
+                        title="仓库还没有配置任何远程地址：点这里填写（等价 git remote add origin <url>）"
+                        onClick={(e) => {
+                          e.stopPropagation(); // 别冒泡去开仓库菜单
+                          setPathMenuOpen(false);
+                          openRemoteSettings();
+                        }}
+                      >
+                        无远程
+                      </span>
+                    </>
+                  );
+                }
+                const localName = repo.currentBranch;
                 return (
                   <>
                     <span className="repo-widget-sep">/</span>
-                    <span className="repo-widget-chip remote" title={`跟踪分支：${upstream}`}>
-                      <BranchGlyph remote />
-                      {short}
+                    <span
+                      className="repo-widget-chip unbound"
+                      title="当前分支未关联远程分支：点这里绑定（也可以右键左侧分支树里的分支）——只改本地配置，不推送"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPathMenuOpen(false);
+                        openBindDialog(localName);
+                      }}
+                    >
+                      <WarnGlyph />
+                      未关联远程
                     </span>
                   </>
                 );
@@ -2340,7 +2465,9 @@ function App() {
                     <div
                       key={b.name}
                       className={`branch-tree-item ${b.isHead ? "current" : "clickable"}`}
-                      title={b.isHead ? "当前分支（右键更多操作）" : `点击切换到 ${b.name}（右键更多操作）`}
+                      title={`${b.isHead ? "当前分支" : `点击切换到 ${b.name}`} · ${
+                        b.upstream ? `跟踪 ${b.upstream}` : "未绑定远程分支"
+                      }（右键更多操作）`}
                       onClick={() => !b.isHead && checkoutBranch(b.name)}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -3141,6 +3268,30 @@ function App() {
             style={{ left: branchCtx.x, top: branchCtx.y }}
             onClick={(e) => e.stopPropagation()}
           >
+            {/* 上游绑定：已绑定给「解除绑定」，未绑定给「绑定远程分支…」——一个位置只放当前该做的那件事 */}
+            {(() => {
+              const b = localBranches.find((x) => x.name === branchCtx.name);
+              return b?.upstream ? (
+                <button
+                  className="recent-menu-item"
+                  title={`解绑后 push/pull 不再知道往哪儿推：git branch --unset-upstream ${branchCtx.name}`}
+                  onClick={() => {
+                    doUnbind(branchCtx.name);
+                    setBranchCtx(null);
+                  }}
+                >
+                  ⇄ 解除绑定（跟踪 {b.upstream}）
+                </button>
+              ) : (
+                <button
+                  className="recent-menu-item"
+                  title="只改本地配置，不 fetch、不推送"
+                  onClick={() => openBindDialog(branchCtx.name)}
+                >
+                  ⇄ 绑定远程分支…
+                </button>
+              );
+            })()}
             <button
               className="recent-menu-item"
               onClick={async () => {
@@ -3164,6 +3315,80 @@ function App() {
             >
               ✎ 重命名分支…
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* 绑定远程分支弹层（upstream）。只改 .git/config，不联网 */}
+      {bindTarget && (
+        <div className="ctx-overlay dim" onClick={() => setBindTarget(null)}>
+          <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title" style={{ color: "var(--accent)" }}>
+              绑定远程分支
+            </div>
+            <div className="confirm-path" title={bindTarget}>
+              {bindTarget}
+            </div>
+            {remoteBranches.length === 0 ? (
+              // 一个远程跟踪分支都没有：多半是没 fetch 过，绑定没有候选可选
+              <div className="confirm-desc">
+                本地还没有任何远程跟踪分支（refs/remotes/*）。多数情况是还没抓取过远程——
+                先 fetch 一次，把远程分支拿到本地再来绑定。
+              </div>
+            ) : (
+              <>
+                <div className="bind-row">
+                  <span className="bind-label">绑定到</span>
+                  <select
+                    className="bind-select"
+                    value={bindUpstream}
+                    onChange={(e) => setBindUpstream(e.currentTarget.value)}
+                  >
+                    {remoteBranches.map((b) => (
+                      <option key={b.name} value={b.name}>
+                        {b.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="confirm-desc">
+                  只写入 .git/config 的 branch.{bindTarget}.remote / .merge，
+                  不 fetch、不推送。之后 push / pull 就以它为上游。
+                </div>
+              </>
+            )}
+            <div className="confirm-actions">
+              {remoteBranches.length === 0 ? (
+                <button
+                  onClick={() => {
+                    setBindTarget(null);
+                    doRemoteOp("fetch");
+                  }}
+                >
+                  先 fetch
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => doBindUpstream(bindTarget, bindUpstream, false)}
+                    disabled={!bindUpstream}
+                  >
+                    绑定
+                  </button>
+                  <button
+                    className="ghost"
+                    title={`绑定后立刻推一次：git push ${bindUpstream.split("/")[0]} ${bindTarget}:${bindUpstream.slice(bindUpstream.indexOf("/") + 1)}`}
+                    onClick={() => doBindUpstream(bindTarget, bindUpstream, true)}
+                    disabled={!bindUpstream}
+                  >
+                    绑定并推送
+                  </button>
+                </>
+              )}
+              <button className="ghost" onClick={() => setBindTarget(null)}>
+                取消
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -148,6 +148,21 @@ body {
   flex-shrink: 0;
 }
 
+/* 未绑定上游 / 无远程：琥珀色虚框徽标，和「已绑定」的灰色上游徽标一眼区分 */
+.repo-widget-chip.unbound {
+  color: var(--yellow);
+  border: 1px dashed var(--yellow);
+  border-radius: 8px;
+  padding: 0 7px;
+  line-height: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.repo-widget-chip.unbound:hover {
+  background: rgba(215, 186, 125, 0.14);
+}
+
 .repo-input[readonly].has-repo:hover {
   border-color: var(--accent-2);
 }
@@ -1127,6 +1142,36 @@ button.ghost.small {
   font-size: 12px;
   color: var(--text-dim);
   line-height: 1.6;
+}
+
+/* 绑定远程分支弹层里的「绑定到」下拉行 */
+.bind-row {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bind-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.bind-select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 13px;
+  outline: none;
+}
+
+.bind-select:focus {
+  border-color: var(--accent-2);
 }
 
 .confirm-actions {

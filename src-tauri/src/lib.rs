@@ -754,6 +754,85 @@ fn delete_branch(state: tauri::State<AppState>, name: String, force: bool) -> Re
     })
 }
 
+// ---------- 上游分支关联（upstream / 分支绑定） ----------
+//
+// 等价 git 命令：
+//   绑定：git branch -u origin/main main      （--set-upstream-to：上游在前，本地分支在后）
+//   解绑：git branch --unset-upstream main
+// 两者都**只写 .git/config**（branch.<本地>.remote / branch.<本地>.merge），不 fetch、不 push，
+// 也不需要先切到那个分支——所以用 git2 原生 API 完成，不走 git CLI 侧车（侧车留给要联网的操作）。
+//
+// 注意 libgit2 的隐含前置条件：它内部会按 GIT_BRANCH_REMOTE 去找 <name>，
+// 也就是 refs/remotes/<remote>/<branch> **必须已经在本地存在**（之前 fetch 或 push 过）。
+// 否则只报一句 "cannot set upstream for branch 'x'"，所以这里提前判一次，换成能照着做的提示。
+
+/// 列出仓库已配置的远程名（纯本地读 config，不联网）。
+/// 前端用它区分顶栏该显示「未关联远程」（有远程、只是没绑）还是「无远程」（连地址都没配），
+/// 以及绑定弹层里的远程候选。
+#[tauri::command]
+fn list_remotes(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    with_repo!(state, repo, {
+        let names = repo.remotes().map_err(to_err)?;
+        Ok(names.iter().flatten().map(|s| s.to_string()).collect())
+    })
+}
+
+/// set_branch_upstream 的实现体（拆出来是为了能脱离 Tauri State 直接单测）。
+/// upstream 传 None / 空串表示解绑。
+fn set_upstream_impl(repo: &Repository, local: &str, upstream: Option<&str>) -> Result<String, String> {
+    let mut branch = repo
+        .find_branch(local, BranchType::Local)
+        .map_err(|e| format!("找不到本地分支 {local}：{}", e.message()))?;
+
+    let target = upstream.map(str::trim).filter(|u| !u.is_empty());
+
+    let Some(name) = target else {
+        branch.set_upstream(None).map_err(to_err)?;
+        return Ok(format!("已解除 {local} 的远程分支关联（只改本地配置）"));
+    };
+
+    if repo.find_branch(name, BranchType::Remote).is_err() {
+        return Err(format!(
+            "本地没有远程跟踪分支 {name}，绑定不了。\n\
+             通常是这个分支还没 fetch 下来：先点一次 fetch 再看；也顺手确认分支名有没有写错。"
+        ));
+    }
+
+    branch.set_upstream(Some(name)).map_err(to_err)?;
+
+    // 读回真正的配置值再回报，避免「以为绑上了」——libgit2 会按 remote 的 fetch refspec
+    // 反推 branch.<名字>.merge 的值，回读能顺带验证这一步没出错
+    let applied = branch
+        .upstream()
+        .ok()
+        .and_then(|u| u.name().ok().flatten().map(|s| s.to_string()))
+        .unwrap_or_else(|| name.to_string());
+    Ok(format!(
+        "已把 {local} 绑定到 {applied}（只改 .git/config，未推送）"
+    ))
+}
+
+/// 绑定 / 解绑本地分支的上游。
+/// upstream 形如 "origin/main"（远程跟踪分支短名）；传 None（或空串）表示解绑。
+/// 本地分支名与远程分支名可以不同——这正是「名字对不上时手动绑定」的主要用例。
+#[tauri::command]
+fn set_branch_upstream(
+    state: tauri::State<AppState>,
+    local: String,
+    upstream: Option<String>,
+) -> Result<String, String> {
+    let local = local.trim().to_string();
+    if local.is_empty() {
+        return Err("本地分支名不能为空".to_string());
+    }
+    with_repo!(state, repo, {
+        let target = upstream
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+        set_upstream_impl(repo, &local, target.as_deref())
+    })
+}
+
 // ---------- 暂存与提交 ----------
 
 // ---------- Stash（本地操作，直接用 git2 原生 API） ----------
@@ -962,9 +1041,40 @@ fn git_remote_op(
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
 
-        let mut args = vec![op.clone(), remote_name];
+        // 未绑定上游的分支上 `git push origin`（不带 refspec）会直接 fatal：
+        //   "The current branch X has no upstream branch."
+        // 因为 push.default 默认是 simple，没有 upstream 就不知道该往哪儿推。
+        // 界面上的「↑ push」按钮正好走这条路径（branch 传 null），于是新分支第一次根本推不上去。
+        // 这里在缺 upstream 时补 --set-upstream，等价 `git push -u origin <当前分支>`：
+        // 推上去的同时建立跟踪，后面的 ahead/behind 角标也才有意义。
+        let mut set_upstream = false;
+        let mut current = None;
+        if op == "push" && branch_name.is_none() {
+            let cur = repo
+                .head()
+                .ok()
+                .filter(|h| h.is_branch())
+                .and_then(|h| h.shorthand().map(|s| s.to_string()));
+            let has_upstream = cur
+                .as_deref()
+                .and_then(|n| repo.find_branch(n, BranchType::Local).ok())
+                .and_then(|b| b.upstream().ok())
+                .is_some();
+            set_upstream = cur.is_some() && !has_upstream;
+            current = cur;
+        }
+
+        let mut args: Vec<String> = vec![op.clone(), remote_name.clone()];
+        if set_upstream {
+            args.push("--set-upstream".to_string());
+        }
         if let Some(b) = branch_name {
             args.push(b);
+        } else if set_upstream {
+            // 只有确认缺 upstream 才补分支名；否则保持原来的 `git push origin` 语义
+            if let Some(cur) = current {
+                args.push(cur);
+            }
         }
         // git 2.27+ 在分支分叉且未配置 pull.rebase / pull.ff 时会直接 fatal:
         // "Need to specify how to reconcile divergent branches"，连合并都不会做。
@@ -1220,6 +1330,8 @@ pub fn run() {
             create_branch,
             delete_branch,
             rename_branch,
+            list_remotes,
+            set_branch_upstream,
             stage_all,
             stage_files,
             discard_file_changes,
@@ -1364,5 +1476,80 @@ mod tests {
             assert!(index_conflicts(&repo).unwrap().is_empty());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 建一个「远程分支已存在、但本地故意没绑定」的仓库，返回 work 目录。
+    /// push 时不带 -u，正好复现用户遇到的状态。
+    fn make_repo_with_remote(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "gitmanage-upstream-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let remote = base.join("remote.git");
+        let dir = base.join("work");
+
+        git_ok(&base, &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-b", "main"]);
+        git_ok(&dir, &["config", "user.email", "t@t"]);
+        git_ok(&dir, &["config", "user.name", "t"]);
+        write(&dir, "a.txt", "1\n");
+        git_ok(&dir, &["add", "."]);
+        git_ok(&dir, &["commit", "-m", "base"]);
+        git_ok(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_ok(&dir, &["push", "origin", "main"]); // 不带 -u
+        dir
+    }
+
+    fn cfg_text(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(".git/config")).unwrap()
+    }
+
+    #[test]
+    fn bind_and_unbind_upstream() {
+        let dir = make_repo_with_remote("bind");
+
+        {
+            let repo = Repository::open(&dir).unwrap();
+            let main = repo.find_branch("main", BranchType::Local).unwrap();
+
+            // 前置：push 没带 -u → 此刻没有上游
+            assert!(main.upstream().is_err(), "不该有 upstream");
+
+            // 绑定 = 只写配置
+            let msg = set_upstream_impl(&repo, "main", Some("origin/main")).unwrap();
+            assert!(msg.contains("origin/main"), "回执要带上游名：{msg}");
+            let cfg = cfg_text(&dir);
+            assert!(cfg.contains("remote = origin"), "config 应有 remote：{cfg}");
+            assert!(cfg.contains("merge = refs/heads/main"), "config 应有 merge：{cfg}");
+
+            // 解绑：两条都清掉
+            set_upstream_impl(&repo, "main", None).unwrap();
+            let main = repo.find_branch("main", BranchType::Local).unwrap();
+            assert!(main.upstream().is_err(), "解绑后不该有 upstream");
+            let cfg = cfg_text(&dir);
+            assert!(!cfg.contains("merge = refs/heads/main"), "解绑后 merge 应消失：{cfg}");
+        }
+
+        // 本地名 ≠ 远程名：git CLI 先建分支（Windows 上 git2 句柄要先释放）
+        git_ok(&dir, &["branch", "feature/login"]);
+        {
+            let repo = Repository::open(&dir).unwrap();
+            set_upstream_impl(&repo, "feature/login", Some("origin/main")).unwrap();
+            // merge 指向的是远程那个名字，不是本地名 —— 这正是名字不同时的关键
+            let cfg = cfg_text(&dir);
+            assert!(cfg.contains("merge = refs/heads/main"), "merge 应跟远程名：{cfg}");
+            let b = repo.find_branch("feature/login", BranchType::Local).unwrap();
+            assert_eq!(b.upstream().unwrap().name().unwrap(), Some("origin/main"));
+
+            // 上游 ref 不存在 → 报错要能照着做
+            let err = set_upstream_impl(&repo, "feature/login", Some("origin/nope")).unwrap_err();
+            assert!(err.contains("fetch"), "错误提示应引导先 fetch：{err}");
+        }
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
