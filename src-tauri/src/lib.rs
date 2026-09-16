@@ -1199,7 +1199,15 @@ fn git_remote_op(
         if out.status.success() {
             Ok(combined)
         } else {
-            let hint = if combined.contains("could not read Username")
+            // pull 不带 refspec 时 git 只认「当前分支的 upstream」，没有上游就直接失败退出（码 1，
+            // 什么都没合）：
+            //   "You asked to pull from the remote 'origin', but did not specify a branch."
+            // 行为是安全的（不会误合远程默认分支），但这句原文对 GUI 用户太绕——他没写过 git 命令的话
+            // 看不出「缺的是绑定」，所以这里补一句该去哪儿绑。
+            let no_upstream = op == "pull" && combined.contains("but did not specify");
+            let hint = if no_upstream {
+                "\n\n提示：当前分支未关联远程分支，git 不知道该合并哪一条（未做任何改动）。\n绑定入口：左栏分支树里右键当前分支 →「⇄ 绑定远程分支…」，选一个上游后再点 pull。"
+            } else if combined.contains("could not read Username")
                 || combined.contains("Authentication failed")
                 || combined.contains("Permission denied")
             {
