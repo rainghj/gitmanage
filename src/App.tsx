@@ -142,6 +142,8 @@ interface CommitInfo {
   time: number;
   parents: string[];
   refs: string[];
+  /** 能否从本地 HEAD 走到；false = 只有上游/远程一侧有，即「待拉取」的提交 */
+  reachable: boolean;
 }
 
 interface FileChange {
@@ -2162,6 +2164,12 @@ function App() {
   }, [selected]);
 
   const { rows: graphRows, laneCount } = useMemo(() => computeGraph(commits), [commits]);
+  // 「待拉取」= 列表里那些从本地 HEAD 走不到的提交（后端按可达性标记）。
+  // 有分支过滤时不算数：那时列表语义是「某个 ref 的历史」，不是「当前分支要拉什么」。
+  const pendingCommits = useMemo(
+    () => (filterBranch ? [] : commits.filter((c) => !c.reachable)),
+    [commits, filterBranch]
+  );
   const localBranches = branches.filter((b) => !b.isRemote);
   // 排除 origin/HEAD 这类**符号引用**：它只是「远端默认分支」的别名（远端一改默认分支它就漂），
   // 点它等于检出一个叫 HEAD 的本地分支，纯属噪音。它同时也不该是上游候选/过滤项，见下。
@@ -2976,7 +2984,8 @@ function App() {
                 onChange={(e) => setFilterBranch(e.currentTarget.value)}
                 title="按分支过滤"
               >
-                <option value="">全部（HEAD）</option>
+                {/* 绑了上游时列表会并进远程领先的提交，标签得说清楚，否则多出来的行来路不明 */}
+                <option value="">{headBranch?.upstream ? "全部（HEAD + 上游）" : "全部（HEAD）"}</option>
                 {localBranches.map((b) => (
                   <option key={b.name} value={b.name}>⎇ {b.name}</option>
                 ))}
@@ -3016,11 +3025,21 @@ function App() {
                   className="ghost small"
                   onClick={() => doRemoteOp("pull")}
                   disabled={opBusy !== null}
-                  title={
-                    syncCounts && syncCounts[1] > 0
-                      ? `git pull（当前分支）—— 远程领先 ${syncCounts[1]} 条（基于上次 fetch）`
-                      : "git pull（当前分支）"
-                  }
+                  title={(() => {
+                    const base =
+                      syncCounts && syncCounts[1] > 0
+                        ? `git pull（当前分支）—— 远程领先 ${syncCounts[1]} 条（基于上次 fetch）`
+                        : "git pull（当前分支）";
+                    if (!pendingCommits.length) return base;
+                    // 悬停就列出「要拉的是什么」，不用先去列表里翻（最多列 8 条，够看清性质）
+                    const lines = pendingCommits
+                      .slice(0, 8)
+                      .map((c) => `  ${c.short} ${c.summary}`);
+                    if (pendingCommits.length > 8) {
+                      lines.push(`  … 还有 ${pendingCommits.length - 8} 条`);
+                    }
+                    return `${base}\n将拉取：\n${lines.join("\n")}`;
+                  })()}
                 >
                   {opBusy === "pull" ? "…" : "↓ pull"}
                   {!opBusy && syncCounts && syncCounts[1] > 0 && (
@@ -3082,7 +3101,7 @@ function App() {
               {commits.map((c, i) => (
                 <div
                   key={c.oid}
-                  className={`commit-item ${selected === c.oid ? "selected" : ""}${c.parents.length > 1 ? " is-merge" : ""}`}
+                  className={`commit-item ${selected === c.oid ? "selected" : ""}${c.parents.length > 1 ? " is-merge" : ""}${c.reachable ? "" : " pending"}`}
                   onClick={() => setSelected(c.oid)}
                   onContextMenu={(e) => {
                     e.preventDefault();
@@ -3095,6 +3114,12 @@ function App() {
                     {/* 单行布局（IDEA 风格）：hash + refs + message 省略号，作者·时间右对齐 */}
                     <div className="commit-summary">
                       <span className="hash">{c.short}</span>
+                      {/* 「待拉取」：远程已有、本地 HEAD 还没拉到的提交，点开一样能看 diff */}
+                      {!c.reachable && (
+                        <span className="ref-chip pull" title="远程已有、本地还没拉下来的提交">
+                          待拉取
+                        </span>
+                      )}
                       {c.refs.map((r) => (
                         <span key={r} className={`ref-chip ${r.includes("/") ? "remote" : "local"}`}>
                           {r}

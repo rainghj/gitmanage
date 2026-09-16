@@ -17,7 +17,7 @@ use git2::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager; // AppHandle::path() 来自这个 trait
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -99,6 +99,9 @@ struct CommitInfo {
     time: i64,
     parents: Vec<String>,
     refs: Vec<String>,
+    /// 该提交能否从本地 HEAD 走到。false = 只存在于上游/远程一侧，即「还没拉下来的提交」。
+    /// 前端据此把它标成「待拉取」并降一档亮度。
+    reachable: bool,
 }
 
 #[derive(Serialize)]
@@ -290,10 +293,41 @@ fn get_log(
             }
         }
 
+        // 当前分支的上游 ref（未绑定 → None）。只有「全部（HEAD）」视图会把它的历史并进来。
+        // 不并的话，fetch 下来、本地还没有的提交在列表里压根不存在——徽标数字变了，却看不到到底要拉什么。
+        let upstream_oid = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(|s| s.to_string()))
+            .and_then(|name| repo.find_branch(&name, BranchType::Local).ok())
+            .and_then(|b| b.upstream().ok().and_then(|u| u.get().target()));
+
+        // HEAD 可达集合：用来标出「本地 HEAD 还没有」的提交。
+        // 单独走一次 revwalk 收集，而不是对每行调 graph_descendant_of——那是每行一次图遍历。
+        // 上限 = 输出遍历窗口（max_scan）的 10 倍：能出现在结果里的行最远只在两头顶端 1 万步内，
+        // 可达的最老祖先必然在 HEAD 的 1 万步内，所以 10 万的上限对本视图是完备的。
+        const HEAD_REACH_CAP: usize = 100_000;
+        let mut head_reach: HashSet<Oid> = HashSet::new();
+        let mut head_ok = false;
+        if let Ok(mut rw) = repo.revwalk() {
+            if rw.push_head().is_ok() {
+                head_ok = true;
+                for oid in rw.flatten().take(HEAD_REACH_CAP) {
+                    head_reach.insert(oid);
+                }
+            }
+        }
+
         let mut revwalk = repo.revwalk().map_err(to_err)?;
         // 分支过滤：None / "HEAD" / "" 视为当前 HEAD；其余按 ref 名解析
         match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            None | Some("HEAD") => revwalk.push_head().map_err(to_err)?,
+            None | Some("HEAD") => {
+                revwalk.push_head().map_err(to_err)?;
+                // 并上游：上游就是 HEAD（已同步）时重复 push 同一个 oid 无害
+                if let Some(u) = upstream_oid {
+                    revwalk.push(u).map_err(to_err)?;
+                }
+            }
             Some(name) => {
                 let obj = repo.revparse_single(name).map_err(to_err)?;
                 revwalk.push(obj.id()).map_err(to_err)?;
@@ -339,6 +373,9 @@ fn get_log(
                 time: commit.time().seconds(),
                 parents: commit.parent_ids().map(|o| o.to_string()).collect(),
                 refs: refmap.remove(&oid.to_string()).unwrap_or_default(),
+                // head_ok=false 表示连 HEAD 都解析不出来（空仓库等异常路径），
+                // 此时一律视为可达，免得整屏被误标成「待拉取」
+                reachable: !head_ok || head_reach.contains(&oid),
             });
         }
         Ok(out)

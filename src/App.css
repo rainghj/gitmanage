@@ -1402,6 +1402,25 @@ button.ghost.small {
   opacity: 0.8;
 }
 
+/* 「待拉取」：远程已有、本地 HEAD 还没走到的提交。降一档亮度表示"还不在本地"，
+   但比 merge 行亮（0.55）—— 这恰恰是用户要看的内容，别压得太狠 */
+.commit-item.pending .hash,
+.commit-item.pending .summary-text {
+  opacity: 0.72;
+}
+
+.commit-item.pending.selected .hash,
+.commit-item.pending.selected .summary-text {
+  opacity: 0.92;
+}
+
+/* 「待拉取」chip 用描边而非实心：它标的是状态，不是 ref 名，跟实心的分支 chip 区分开 */
+.ref-chip.pull {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
 /* ---------- 右栏 ---------- */
 
 /* 提交详情头（IDEA 风格：选中提交的完整信息常驻顶部） */
