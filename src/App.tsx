@@ -170,6 +170,40 @@ interface StashEntry {
   oid: string;
 }
 
+/** 提交身份（user.name / user.email）。生效值按 git 层级叠加；level 说明值来自哪一层 */
+interface IdentityInfo {
+  name: string;
+  email: string;
+  nameLevel: string;
+  emailLevel: string;
+  localName: string;
+  localEmail: string;
+  globalName: string;
+  globalEmail: string;
+}
+
+/** 用当前身份重写 HEAD 作者的结果 */
+interface AmendResult {
+  oldAuthor: string;
+  newAuthor: string;
+  oldOid: string;
+  newOid: string;
+  /** 原提交已在远端（= 上游 tip 就是它）：改写后本地与远端分叉，push 会被拒 */
+  alreadyPushed: boolean;
+}
+
+/** 当前仓库推送时会用的凭据（后端让 git 自己回答） */
+interface RemoteCredential {
+  url: string;
+  scheme: string;
+  host: string;
+  username: string;
+  hasCredential: boolean;
+  /** "ok" | "warn" | "info" */
+  level: string;
+  note: string;
+}
+
 interface ConflictFile {
   path: string;
   hasBase: boolean;
@@ -1378,7 +1412,40 @@ function WarnGlyph() {
   );
 }
 
+/** 提交身份图标（描边人形，和分支/警告图标同一套线条重量） */
+function UserGlyph() {
+  return (
+    <svg
+      className="branch-glyph"
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle cx="8" cy="5.6" r="2.6" stroke="currentColor" strokeWidth="1.3" />
+      <path
+        d="M2.9 13.6c0-2.5 2.3-4.2 5.1-4.2s5.1 1.7 5.1 4.2"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 // ---------- 通用小工具 ----------
+
+/** 配置层级的中文说法（后端回传的是 libgit2 的 ConfigLevel 字面量） */
+const LEVEL_LABEL: Record<string, string> = {
+  local: "本仓库 .git/config",
+  global: "全局 ~/.gitconfig",
+  xdg: "全局（XDG 配置）",
+  system: "系统级 gitconfig",
+  programdata: "系统级（ProgramData）",
+  worktree: "worktree 配置",
+  app: "应用级配置",
+};
 
 function useDebounced<T>(value: T, ms: number): T {
   const [v, setV] = useState(value);
@@ -1432,6 +1499,18 @@ function App() {
   const [leftTab, setLeftTab] = useState<"branches" | "files" | "conflicts">("branches"); // 左栏顶部 tab：分支树 / 文件树 / 冲突
   const [remoteUrlOpen, setRemoteUrlOpen] = useState(false); // 中栏过滤条上的「设置远程」输入行
   const [remoteUrl, setRemoteUrl] = useState("");
+  // 提交身份：identity 是后端算好的「生效值 + 来源层」，顶栏徽标与弹层都读它
+  const [identity, setIdentity] = useState<IdentityInfo | null>(null);
+  const [identityOpen, setIdentityOpen] = useState(false);
+  const [idName, setIdName] = useState("");
+  const [idEmail, setIdEmail] = useState("");
+  // 编辑作用域：默认「本仓库」。工作项目要独立身份时，local 覆盖是主路径
+  const [idScope, setIdScope] = useState<"local" | "global">("local");
+  const [idSaving, setIdSaving] = useState(false);
+  // 「用当前身份重写作者」的确认弹层（改写历史，必须先确认）
+  const [amendOpen, setAmendOpen] = useState(false);
+  // 当前仓库的推送凭据（懒加载：查一次要起个 git 子进程，只在打开身份面板时拉）
+  const [credential, setCredential] = useState<RemoteCredential | null>(null);
   // [ahead, behind]：待 push / 待 pull 条数；null = 无上游（纯本地仓库）不显示角标
   const [syncCounts, setSyncCounts] = useState<[number, number] | null>(null);
   // 仓库已配置的远程名。用来区分顶栏该提示「未关联远程」（有远程、只是没绑）
@@ -1489,7 +1568,7 @@ function App() {
   const refresh = useCallback(async () => {
     if (!repo) return;
     try {
-      const [bs, log, t, st, s, ab, sk, cf, rm] = await Promise.all([
+      const [bs, log, t, st, s, ab, sk, cf, rm, id] = await Promise.all([
         invoke<BranchInfo[]>("list_branches"),
         invoke<CommitInfo[]>("get_log", {
           limit: logLimit,
@@ -1503,6 +1582,7 @@ function App() {
         invoke<string[]>("get_skip_list"),
         invoke<ConflictFile[]>("get_conflicts"),
         invoke<string[]>("list_remotes"),
+        invoke<IdentityInfo>("get_identity"),
       ]);
       setBranches(bs);
       setCommits(log);
@@ -1513,6 +1593,7 @@ function App() {
       setSkipList(sk);
       setConflicts(cf);
       setRemotes(rm);
+      setIdentity(id);
       // 已打开的文件/对比标签内容可能已过时，清空缓存让激活标签重拉
       setTabData({});
     } catch (e) {
@@ -1734,6 +1815,9 @@ function App() {
     setConsoleOpen(false);
     setRepoPath("");
     setPathMenuOpen(false);
+    // 身份是按仓库读的，关掉仓库后必须清空 —— 否则欢迎页/下一个仓库会闪出上一个仓库的徽标
+    setIdentity(null);
+    setIdentityOpen(false);
   }
 
   // 点击菜单外部关闭
@@ -1937,6 +2021,34 @@ function App() {
       setUnchecked(new Set());
       await refresh();
     } catch (e) {
+      // 仓库没配 user.name / user.email 时，libgit2 只丢一句 "config value 'user.name' was
+      // not found"（git2 的 signature() 在这个场景返回 NotFound），完全看不出该去哪儿配。
+      // 这里补一句指向顶栏那个徽标，省得用户以为提交功能坏了
+      const msg = String(e);
+      const noIdentity =
+        msg.includes("user.name") || msg.includes("user.email") || msg.includes("was not found");
+      setError(noIdentity ? `${msg}\n\n提示：仓库还没配置提交身份（user.name / user.email）。点顶栏的「未配置身份」徽标填一下即可。` : msg);
+    }
+  }
+
+  // 用当前身份重写 HEAD 提交的作者（后端只换 author 的名字/邮箱，保留原作者时间）
+  async function doAmendAuthor() {
+    setAmendOpen(false);
+    try {
+      const r = await invoke<AmendResult>("amend_head_author");
+      setSelected(null); // 选中态记的是旧 oid，改写后它已经不存在了
+      await refresh();
+      const warn = r.alreadyPushed
+        ? "\n\n注意：原提交已经在远端，本地与远端已经分叉 —— 下次 push 会被拒，只能 force push。" +
+          "如果别人已经拉过这条提交，别这么做。"
+        : "";
+      setConsoleText(
+        `> git commit --amend --author="${r.newAuthor}"\n` +
+          `作者已重写：${r.oldAuthor} → ${r.newAuthor}\n` +
+          `hash ${r.oldOid.slice(0, 7)} → ${r.newOid.slice(0, 7)}${warn}`,
+      );
+      setConsoleOpen(true);
+    } catch (e) {
       setError(String(e));
     }
   }
@@ -2130,6 +2242,82 @@ function App() {
     }
   }
 
+  // ---------- 提交身份（user.name / user.email） ----------
+  //
+  // 生效值按 git 层级叠加：local（本仓库 .git/config）覆盖 global（~/.gitconfig）。
+  // 工作项目用独立身份的做法，就是只给那个仓库写一份 local 覆盖，不动全局。
+
+  // 弹层预填：优先用该作用域**已显式写着**的值；没写过就退回当前生效值。
+  // 后者是为了让「把全局身份复制过来改个邮箱」这种最常见的诉求不用手打一遍。
+  function prefillIdentity(scope: "local" | "global", info: IdentityInfo | null) {
+    if (!info) return;
+    setIdName(((scope === "local" ? info.localName : info.globalName) || info.name) ?? "");
+    setIdEmail(((scope === "local" ? info.localEmail : info.globalEmail) || info.email) ?? "");
+  }
+
+  function openIdentityDialog() {
+    if (identityOpen) {
+      setIdentityOpen(false);
+      return;
+    }
+    setPathMenuOpen(false);
+    // 默认落在「本仓库」：有覆盖就编辑覆盖，没覆盖就从生效值起手
+    setIdScope("local");
+    prefillIdentity("local", identity);
+    setIdentityOpen(true);
+    // 凭据另拉：它要起一个 git 子进程，不进 refresh 的批量请求；失败就当查不到，不打扰用户
+    setCredential(null);
+    invoke<RemoteCredential>("get_remote_credential")
+      .then(setCredential)
+      .catch(() => setCredential(null));
+  }
+
+  // 切换作用域时同步换预填内容，否则会出现「切到全局却看到本仓库的值」的错觉
+  function switchIdentityScope(scope: "local" | "global") {
+    setIdScope(scope);
+    prefillIdentity(scope, identity);
+  }
+
+  async function saveIdentity() {
+    const name = idName.trim();
+    const email = idEmail.trim();
+    // 前端先挡一道，只为即时反馈；真正的把关在后端（校验全部前置，避免留下半截配置）
+    if (!name) {
+      setError("用户名不能为空");
+      return;
+    }
+    if (!email || !email.includes("@")) {
+      setError("邮箱不能为空，且必须包含 @");
+      return;
+    }
+    setIdSaving(true);
+    try {
+      const msg = await invoke<string>("set_identity", { name, email, scope: idScope });
+      setIdentity(await invoke<IdentityInfo>("get_identity"));
+      setIdentityOpen(false);
+      setConsoleText(`> git config ${idScope === "global" ? "--global " : ""}user.name\n${msg}`);
+      setConsoleOpen(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIdSaving(false);
+    }
+  }
+
+  // 取消本仓库的身份覆盖，回落到全局身份（只动 local 层）
+  async function clearLocalIdentity() {
+    try {
+      const msg = await invoke<string>("clear_local_identity");
+      const info = await invoke<IdentityInfo>("get_identity");
+      setIdentity(info);
+      prefillIdentity(idScope, info);
+      setConsoleText(`> git config --unset user.name\n${msg}`);
+      setConsoleOpen(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function stashOp(op: "pop" | "apply" | "drop", index: number) {
     const verb = op === "drop" ? "删除" : op === "pop" ? "弹出并应用" : "应用";
     if (!confirm(`确认${verb} stash@{${index}}？`)) return;
@@ -2218,6 +2406,10 @@ function App() {
   // 点琥珀色徽标还会拿旧名字去绑定）。只有分离 HEAD 等拿不到具名分支时才回退到那个快照。
   const headBranch = localBranches.find((b) => b.isHead);
   const headName = headBranch?.name ?? repo?.currentBranch;
+  // HEAD 那条提交（重写作者只对它开放）。按 oid 匹配而不是取 commits[0]：有分支过滤时第一条未必是 HEAD
+  const headCommit = headBranch ? (commits.find((c) => c.oid === headBranch.commit) ?? null) : null;
+  // HEAD 是否已在远端：有上游且本地没领先 → 上游 tip 就是它，改写会让两边分叉
+  const headIsPushed = !!headBranch?.upstream && !!syncCounts && syncCounts[0] === 0;
   // 更改列表拆成两部分：不提交列表里的文件单独成区，不参与勾选提交
   const visibleStatus = status.filter((s) => !skipList.includes(s.path));
   const skippedStatus = status.filter((s) => skipList.includes(s.path));
@@ -2319,6 +2511,50 @@ function App() {
                   </>
                 );
               })()}
+              {/* 提交身份徽标：常显当前生效的 user.name。有本仓库覆盖时额外挂「本仓库」小标 ——
+                  一眼看出这个仓库用的是全局身份还是独立身份，不用去翻 .git/config */}
+              {identity &&
+                (() => {
+                  if (!identity.name) {
+                    return (
+                      <>
+                        <span className="repo-widget-sep">/</span>
+                        <span
+                          className="repo-widget-chip unbound"
+                          title="尚未配置提交身份（user.name / user.email）：点这里设置。不配的话提交会直接失败"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPathMenuOpen(false);
+                            openIdentityDialog();
+                          }}
+                        >
+                          <WarnGlyph />
+                          未配置身份
+                        </span>
+                      </>
+                    );
+                  }
+                  const isLocal =
+                    identity.nameLevel === "local" || identity.emailLevel === "local";
+                  return (
+                    <>
+                      <span className="repo-widget-sep">/</span>
+                      <span
+                        className={`repo-widget-chip identity${isLocal ? " scoped" : ""}`}
+                        title={`提交身份：${identity.name}${identity.email ? ` <${identity.email}>` : ""}\n来源：${LEVEL_LABEL[identity.nameLevel] || "未配置"}${isLocal ? "（本仓库覆盖全局）" : ""}\n点击编辑`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPathMenuOpen(false);
+                          openIdentityDialog();
+                        }}
+                      >
+                        <UserGlyph />
+                        {identity.name}
+                        {isLocal && <span className="identity-scope-tag">本仓库</span>}
+                      </span>
+                    </>
+                  );
+                })()}
             </button>
           ) : (
             /* 欢迎页（未开仓库）：保留原展示框 */
@@ -3454,6 +3690,25 @@ function App() {
             >
               ⧉ 复制提交信息
             </button>
+            {/* 重写作者只对 HEAD 开放：amend 的本质是替换 HEAD，改历史中间某条得走 rebase */}
+            {commitCtx.oid === headBranch?.commit && (
+              <button
+                className="recent-menu-item"
+                disabled={!headCommit}
+                title={
+                  headIsPushed
+                    ? "用顶栏显示的身份重写这条 HEAD 提交的作者。它已经推送到远端了，改写会让本地与远端分叉"
+                    : "用顶栏显示的身份重写这条 HEAD 提交的作者（作者时间、说明、改动内容都不变）"
+                }
+                onClick={() => {
+                  setCommitCtx(null);
+                  setAmendOpen(true);
+                }}
+              >
+                ✎ 用当前身份重写作者…
+                {headIsPushed && <span className="menu-warn">已推送</span>}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -3660,6 +3915,203 @@ function App() {
                 重命名
               </button>
               <button className="ghost" onClick={() => setRenameTarget(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 提交身份编辑弹窗：作用域可切（本仓库 / 全局），并如实显示当前生效值来自哪一层 */}
+      {identityOpen && (
+        <div className="ctx-overlay dim" onClick={() => setIdentityOpen(false)}>
+          <div className="confirm-box identity-box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title" style={{ color: "var(--accent)" }}>
+              提交身份
+              {/* 改的是「当前打开的这个仓库」，把仓库名摆出来 —— 否则在图省事时很容易改错项目 */}
+              {repo && (
+                <span className="identity-repo" title={`正在修改的仓库：${repo.path}`}>
+                  {repo.name}
+                </span>
+              )}
+            </div>
+
+            {/* 当前生效值：改之前先让用户看清现在是谁 —— 尤其是「本仓库覆盖全局」这种状态 */}
+            <div className="identity-current">
+              <span className="identity-current-label">当前生效</span>
+              {identity?.name ? (
+                <span className="identity-current-value">
+                  <UserGlyph />
+                  {identity.name}
+                  {identity.email ? ` <${identity.email}>` : ""}
+                </span>
+              ) : (
+                <span className="identity-current-value missing">未配置</span>
+              )}
+              <span className="identity-current-src">
+                {LEVEL_LABEL[identity?.nameLevel ?? ""] || "未配置"}
+              </span>
+            </div>
+
+            <div className="identity-scopes">
+              <button
+                className={`scope-btn${idScope === "local" ? " active" : ""}`}
+                onClick={() => switchIdentityScope("local")}
+                title="只写本仓库 .git/config，等价 git config user.name（不影响其他仓库）"
+              >
+                仅本仓库
+              </button>
+              <button
+                className={`scope-btn${idScope === "global" ? " active" : ""}`}
+                onClick={() => switchIdentityScope("global")}
+                title="写 ~/.gitconfig，等价 git config --global user.name（所有仓库一起变）"
+              >
+                全局
+              </button>
+            </div>
+            <div className="identity-scope-hint">
+              {idScope === "local"
+                ? "只写入本仓库 .git/config，其他仓库不受影响 —— 工作项目用单独身份选这个"
+                : "写入 ~/.gitconfig，对所有仓库生效；本仓库若已有覆盖，仍然以本仓库为准"}
+            </div>
+
+            <div className="identity-field">
+              <span className="identity-field-label">用户名</span>
+              <input
+                autoFocus
+                className="rename-input"
+                placeholder="例如 Zhang San"
+                value={idName}
+                onChange={(e) => setIdName(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveIdentity();
+                  if (e.key === "Escape") setIdentityOpen(false);
+                }}
+              />
+            </div>
+            <div className="identity-field">
+              <span className="identity-field-label">邮箱</span>
+              <input
+                className="rename-input"
+                placeholder="name@example.com"
+                value={idEmail}
+                onChange={(e) => setIdEmail(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveIdentity();
+                  if (e.key === "Escape") setIdentityOpen(false);
+                }}
+              />
+            </div>
+
+            {/* 推送凭据：回答「这个仓库推的时候以谁的身份连服务器」。
+                它和上面的署名是两回事 —— 署名写进提交记录，凭据决定能不能推上去 */}
+            {credential && (
+              <div className="identity-cred">
+                <div className="identity-cred-head">
+                  <span>推送凭据</span>
+                  <span className={`cred-badge ${credential.level}`}>
+                    {credential.level === "ok"
+                      ? "已配置"
+                      : credential.level === "warn"
+                        ? "无凭据"
+                        : credential.scheme === "ssh"
+                          ? "SSH key"
+                          : "不适用"}
+                  </span>
+                </div>
+                <div className="amend-row">
+                  <span className="amend-label">远程</span>
+                  <span className="amend-value" title={credential.url}>
+                    {credential.url}
+                  </span>
+                </div>
+                {credential.username && (
+                  <div className="amend-row">
+                    <span className="amend-label">账号</span>
+                    <span className="amend-value">{credential.username}</span>
+                  </div>
+                )}
+                <div className="identity-cred-note">{credential.note}</div>
+                {/* 署名与推送账号不一致本身不算错，但值得点出来：
+                    「提交记录里写的是谁」和「以谁的身份登录」是两套东西 */}
+                {!!identity?.name &&
+                  !!credential.username &&
+                  identity.name !== credential.username && (
+                    <div className="identity-cred-note warn">
+                      署名「{identity.name}」与推送账号「{credential.username}
+                      」不同 —— 提交记录里写的是前者，连服务器用的是后者
+                    </div>
+                  )}
+              </div>
+            )}
+
+            <div className="confirm-actions">
+              {/* 只在「本仓库真的有覆盖」时才给这个入口，避免出现点了没反应的按钮 */}
+              {idScope === "local" && !!(identity?.localName || identity?.localEmail) && (
+                <button
+                  className="ghost"
+                  title="删除本仓库的 user.name / user.email，回落到全局身份（等价 git config --unset）"
+                  onClick={clearLocalIdentity}
+                >
+                  清除本仓库覆盖
+                </button>
+              )}
+              <button
+                onClick={saveIdentity}
+                disabled={idSaving || !idName.trim() || !idEmail.trim()}
+              >
+                {idSaving ? "保存中…" : "保存"}
+              </button>
+              <button className="ghost" onClick={() => setIdentityOpen(false)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 重写作者确认：改写历史之前，把「旧 → 新」和分叉风险摆清楚 */}
+      {amendOpen && (
+        <div className="ctx-overlay dim" onClick={() => setAmendOpen(false)}>
+          <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title" style={{ color: "var(--accent)" }}>
+              用当前身份重写作者
+            </div>
+            <div className="amend-row">
+              <span className="amend-label">提交</span>
+              <span className="amend-value" title={headCommit?.oid}>
+                {headCommit ? `${headCommit.short} ${headCommit.summary}` : "（读取中…）"}
+              </span>
+            </div>
+            <div className="amend-row">
+              <span className="amend-label">作者</span>
+              <span className="amend-value">
+                {headCommit ? `${headCommit.author} <${headCommit.email}>` : "—"}
+                <span className="amend-arrow">→</span>
+                <span className="amend-new">
+                  {identity?.name ? `${identity.name} <${identity.email}>` : "（当前身份未配置）"}
+                </span>
+              </span>
+            </div>
+            {headIsPushed ? (
+              <div className="confirm-desc amend-warn">
+                这条提交已经在远端（{headBranch?.upstream}）了。改写会让本地与远端分叉：下次 push
+                会被拒，只能 force push 覆盖它 —— 如果已经有人拉过这条提交，别这么做。
+              </div>
+            ) : (
+              <div className="confirm-desc">
+                这条还没推送过，改写是安全的。只换作者的名字与邮箱；作者时间、提交说明、改动内容都不动。
+              </div>
+            )}
+            <div className="confirm-actions">
+              <button
+                className={headIsPushed ? "danger-btn" : ""}
+                onClick={doAmendAuthor}
+                disabled={!identity?.name || !identity?.email}
+              >
+                重写
+              </button>
+              <button className="ghost" onClick={() => setAmendOpen(false)}>
                 取消
               </button>
             </div>

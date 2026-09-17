@@ -1280,6 +1280,248 @@ button.ghost.small {
   border-color: var(--accent-2);
 }
 
+/* ---------- 提交身份（顶栏徽标 + 编辑弹层） ---------- */
+
+.repo-widget-chip.identity {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.repo-widget-chip.identity:hover {
+  color: var(--accent-2);
+}
+
+/* 本仓库有独立身份覆盖时加描边：和「跟随全局」的状态一眼分开 */
+.repo-widget-chip.identity.scoped {
+  border: 1px solid var(--accent-2);
+  border-radius: 8px;
+  padding: 0 7px;
+  line-height: 16px;
+  color: var(--accent-2);
+}
+
+/* 「本仓库」小标（只在 local 覆盖时出现） */
+.identity-scope-tag {
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(55, 148, 255, 0.16);
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+
+.identity-box {
+  width: min(460px, 92vw);
+}
+
+/* 标题与仓库名排一行（只在身份弹层里改，不动其他弹窗的 .confirm-title） */
+.identity-box .confirm-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 仓库名角标：身份是按仓库读写的，改之前必须看清是哪个仓库 */
+.identity-repo {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 7px;
+  line-height: 15px;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+/* 当前生效值那一行 */
+.identity-current {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.identity-current-label {
+  flex-shrink: 0;
+}
+
+.identity-current-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text);
+  font-weight: 600;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.identity-current-value .branch-glyph {
+  color: var(--accent-2);
+}
+
+.identity-current-value.missing {
+  color: var(--yellow);
+}
+
+/* 「来自 全局 ~/.gitconfig」这种来源角标 */
+.identity-current-src {
+  font-size: 11px;
+  padding: 0 6px;
+  line-height: 15px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+}
+
+.identity-scopes {
+  margin-top: 12px;
+  display: flex;
+  gap: 6px;
+}
+
+/* 作用域切换：选中态用描边 + 淡底，不用实心块 */
+.scope-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.scope-btn:hover {
+  border-color: var(--accent-2);
+  color: var(--text);
+  filter: none;
+}
+
+.scope-btn.active {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+  background: rgba(55, 148, 255, 0.12);
+}
+
+.identity-scope-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.identity-field {
+  margin-top: 10px;
+}
+
+.identity-field-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 3px;
+}
+
+/* 复用 rename-input 的外观，但间距交给 .identity-field 管，避免两处 margin 叠加 */
+.identity-field .rename-input {
+  margin-top: 0;
+}
+
+/* 弹层里的「推送凭据」区块：纯信息展示，用虚线跟上方的署名编辑区隔开 */
+.identity-cred {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+.identity-cred-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.cred-badge {
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.cred-badge.ok {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.cred-badge.warn {
+  color: var(--yellow);
+  border-color: var(--yellow);
+}
+
+.identity-cred-note {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.identity-cred-note.warn {
+  color: var(--yellow);
+}
+
+/* ---------- 「用当前身份重写作者」弹层 ---------- */
+
+.amend-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  align-items: baseline;
+}
+
+.amend-label {
+  color: var(--text-dim);
+  flex-shrink: 0;
+  width: 30px;
+}
+
+.amend-value {
+  color: var(--text);
+  font-family: Consolas, "Courier New", monospace;
+  word-break: break-all;
+  line-height: 1.6;
+}
+
+.amend-arrow {
+  color: var(--accent-2);
+  margin: 0 6px;
+}
+
+.amend-new {
+  color: var(--accent-2);
+}
+
+/* 改写已推送的提交：用琥珀色提示风险，和「放弃更改」那类红色破坏性操作区分开 */
+.amend-warn {
+  color: var(--yellow);
+}
+
+/* 右键菜单里的「已推送」小标 */
+.menu-warn {
+  margin-left: 6px;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(215, 186, 125, 0.18);
+  color: var(--yellow);
+}
+
 /* 提交历史底部「加载更多」 */
 .load-more {
   display: block;

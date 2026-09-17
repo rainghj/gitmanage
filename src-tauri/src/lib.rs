@@ -12,8 +12,8 @@
 //! git2 使用 default-features=false（无 ssh/https/openssl），只做本地操作。
 
 use git2::{
-    opts, BranchType, DiffFormat, ErrorCode, ObjectType, Oid, Repository, RepositoryState, Sort,
-    TreeWalkResult,
+    opts, BranchType, Config, ConfigLevel, DiffFormat, ErrorCode, ObjectType, Oid, Repository,
+    RepositoryState, Sort, TreeWalkResult,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager; // AppHandle::path() 来自这个 trait
@@ -1289,6 +1289,444 @@ fn set_remote_url(state: tauri::State<AppState>, url: String, name: Option<Strin
     })
 }
 
+// ---------- 提交身份（user.name / user.email） ----------
+//
+// 生效值按 git 的层级优先级叠加（本地覆盖全局）：
+//   worktree > local(.git/config) > global(~/.gitconfig) > xdg > system > programdata
+// libgit2 侧的依据：
+//   - 读：git_config_get_entry 遍历 readers（按 level 降序），**第一个命中的**就是生效值，
+//         它的 level() 正好说明「这个值是从哪一层来的」——所以能如实回显来源。
+//   - 写：git_config_set_string 写「最高层（通常是 local）」，见 libgit2 config.h 原文：
+//         "Set the value of a string config variable in the config file with the highest level
+//          (usually the local one)."
+//         → repo.config().set_str() 等价 `git config user.name`（只动本仓库）；
+//           要写 global 必须先 open_level(Global) 取出**只含 global 层**的 config，
+//           否则照样会写进 local（这是最容易写错的地方）。
+//   - 缓存：repo 的 config 实例在仓库生命周期内复用（repository.c 的 repo->_config），
+//           但 config_file backend 每次读之前都会按 mtime 重载（config_file.c: config_file_get
+//           → config_file_refresh），所以写完之后立刻提交/再读，拿到的都是新值，不存在脏读。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityInfo {
+    /// 当前**生效值**（各层叠加后的结果）；未配置为空串
+    name: String,
+    email: String,
+    /// 生效值来自哪一层："local" / "global" / "system" / "xdg" / "programdata" / "worktree" / "app"；
+    /// 该键完全没配置时为空串
+    name_level: String,
+    email_level: String,
+    /// 各层**显式写着**的值（该层没配 → 空串）。local 用来判断「本仓库是否覆盖过」，
+    /// global 用来在切到全局作用域时预填。
+    local_name: String,
+    local_email: String,
+    global_name: String,
+    global_email: String,
+}
+
+fn config_level_name(level: ConfigLevel) -> &'static str {
+    match level {
+        ConfigLevel::ProgramData => "programdata",
+        ConfigLevel::System => "system",
+        ConfigLevel::XDG => "xdg",
+        ConfigLevel::Global => "global",
+        ConfigLevel::Local => "local",
+        ConfigLevel::Worktree => "worktree",
+        ConfigLevel::App => "app",
+        ConfigLevel::Highest => "highest",
+    }
+}
+
+/// 读**某一层**里显式写着的值。该层没配就是 GIT_ENOTFOUND —— 那是正常情况（比如 local 没覆盖），
+/// 直接当空串，不往上抛错误。
+fn config_level_value(cfg: &Config, level: ConfigLevel, key: &str) -> String {
+    cfg.open_level(level)
+        .ok()
+        .and_then(|c| c.get_string(key).ok())
+        .unwrap_or_default()
+}
+
+/// 读某个键的生效值 + 它来自哪一层。没配置 → ("", "")。
+fn config_effective(cfg: &Config, key: &str) -> (String, String) {
+    match cfg.get_entry(key) {
+        Ok(e) => (
+            e.value().unwrap_or("").to_string(),
+            config_level_name(e.level()).to_string(),
+        ),
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
+/// 读取当前生效的提交身份 + local/global 两层的显式值（编辑面板用）。
+#[tauri::command]
+fn get_identity(state: tauri::State<AppState>) -> Result<IdentityInfo, String> {
+    with_repo!(state, repo, {
+        let cfg = repo.config().map_err(to_err)?;
+        let (name, name_level) = config_effective(&cfg, "user.name");
+        let (email, email_level) = config_effective(&cfg, "user.email");
+        Ok(IdentityInfo {
+            name,
+            email,
+            name_level,
+            email_level,
+            local_name: config_level_value(&cfg, ConfigLevel::Local, "user.name"),
+            local_email: config_level_value(&cfg, ConfigLevel::Local, "user.email"),
+            global_name: config_level_value(&cfg, ConfigLevel::Global, "user.name"),
+            global_email: config_level_value(&cfg, ConfigLevel::Global, "user.email"),
+        })
+    })
+}
+
+/// 写入提交身份。
+/// scope = "local"  只写本仓库 .git/config，等价 `git config user.name "..."`；
+/// scope = "global" 写用户级 ~/.gitconfig，等价 `git config --global user.name "..."`，
+///                  所有仓库一起变（本仓库若已有 local 覆盖，仍然以 local 为准）。
+/// 校验全部前置：宁可什么都不写，也不留下「name 写了 email 没写」这种半截配置 ——
+/// 那种状态下一提交就报 NotFound，比直接报错更难查。
+#[tauri::command]
+fn set_identity(
+    state: tauri::State<AppState>,
+    name: String,
+    email: String,
+    scope: String,
+) -> Result<String, String> {
+    if !matches!(scope.as_str(), "local" | "global") {
+        return Err(format!("不支持的作用域：{scope}（只认 local / global）"));
+    }
+    let name = name.trim().to_string();
+    let email = email.trim().to_string();
+    if name.is_empty() {
+        return Err("用户名不能为空".to_string());
+    }
+    if email.is_empty() || !email.contains('@') {
+        return Err("邮箱不能为空，且必须包含 @".to_string());
+    }
+    with_repo!(state, repo, {
+        // 写哪一层完全取决于 config 实例里那个「可写 backend」：
+        // global 分支用 open_level 取出只含 global 层的实例（libgit2 即使 ~/.gitconfig 不存在
+        // 也会为它开一个可写 backend —— repository.c 有 "If there is no global file, open a
+        // backend for it anyway"，文件会在首次写入时创建）。
+        // 中间那个临时 Config 析构是安全的：git_config__add_instance 对新实例做了
+        // GIT_REFCOUNT_INC，config_free 只是 DEC，backend 不会被提前释放。
+        let mut cfg = if scope == "global" {
+            repo.config()
+                .map_err(to_err)?
+                .open_level(ConfigLevel::Global)
+                .map_err(|e| format!("打不开全局配置（~/.gitconfig）：{e}"))?
+        } else {
+            repo.config().map_err(to_err)?
+        };
+        cfg.set_str("user.name", &name).map_err(to_err)?;
+        cfg.set_str("user.email", &email).map_err(to_err)?;
+
+        let (flag, where_) = if scope == "global" {
+            ("--global ", "全局")
+        } else {
+            ("", "本仓库")
+        };
+        Ok(format!(
+            "已设置{where_}提交身份：{name} <{email}>\n\
+             等价命令：git config {flag}user.name \"{name}\" && git config {flag}user.email \"{email}\""
+        ))
+    })
+}
+
+/// 取消本仓库的身份覆盖（等价 `git config --unset user.name/email`），回落到全局身份。
+/// 只动 local 层；某一边本来就没覆盖时静默跳过 —— libgit2 删不存在的键会报
+/// "could not find key ... to delete"，那不该算失败。
+#[tauri::command]
+fn clear_local_identity(state: tauri::State<AppState>) -> Result<String, String> {
+    with_repo!(state, repo, {
+        let mut cfg = repo
+            .config()
+            .map_err(to_err)?
+            .open_level(ConfigLevel::Local)
+            .map_err(|e| format!("打不开本仓库配置（.git/config）：{e}"))?;
+        for key in ["user.name", "user.email"] {
+            // 先确认这一层确实写着，再删：直接把 ENOTFOUND 当失败会误报
+            if cfg.get_entry(key).is_ok() {
+                cfg.remove(key).map_err(to_err)?;
+            }
+        }
+        Ok("已清除本仓库的身份覆盖，之后沿用全局身份\n\
+            等价命令：git config --unset user.name && git config --unset user.email"
+            .to_string())
+    })
+}
+
+// ---------- 这个仓库推送时会用哪个凭据 ----------
+
+/// 把 remote URL 拆成 (scheme, host, path, user)。支持两种写法：
+///   https://host/path、http://user@host:port/path、ssh://git@host/path
+///   git@host:path（scp 风格，没有 "://"）
+/// 解析不出来就返回全空串（调用方据此给「不支持/认不出」的提示）。
+fn parse_remote_url(url: &str) -> (String, String, String, String) {
+    let s = url.trim();
+    if let Some(idx) = s.find("://") {
+        let scheme = s[..idx].to_lowercase();
+        let rest = &s[idx + 3..];
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+            None => (rest, String::new()),
+        };
+        let (user, host) = match authority.rfind('@') {
+            Some(i) => (authority[..i].to_string(), authority[i + 1..].to_string()),
+            None => (String::new(), authority.to_string()),
+        };
+        return (scheme, host, path, user);
+    }
+    // scp 风格 git@host:path
+    if let (Some(at), Some(colon)) = (s.find('@'), s.find(':')) {
+        if at < colon {
+            return (
+                "ssh".to_string(),
+                s[at + 1..colon].to_string(),
+                s[colon + 1..].to_string(),
+                s[..at].to_string(),
+            );
+        }
+    }
+    (String::new(), String::new(), String::new(), String::new())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteCredential {
+    url: String,
+    /// https / http / ssh / 空（认不出来）
+    scheme: String,
+    host: String,
+    /// git 实际会用的账号名；空 = 没查到
+    username: String,
+    /// 该主机是否已有可用凭据。SSH 恒为 false —— 那条路走 key，跟凭据管理器无关
+    has_credential: bool,
+    /// "ok" | "warn" | "info"，前端据此上色
+    level: String,
+    /// 一句话结论，直接展示
+    note: String,
+}
+
+/// 查「当前仓库推送时会以谁的身份连服务器」，用来回答「我这个项目的凭据正常吗」。
+///
+/// 做法是**让 git 自己回答**：`git credential fill` 是 git 取凭据的唯一入口，它会按完整的
+/// 优先级链（credential.helper → 凭据管理器 → `credential.<url>.*` 配置）算出实际会用的那份，
+/// 比我们自己读 Windows 凭据管理器再猜准得多 —— 还能正确反映 useHttpPath 这类配置的影响。
+///
+/// ⚠️ 输出里的 `password=` 字段**只存在于这个函数的局部字符串里**：不解析、不返回、读完立刻释放。
+/// 返回给前端的只有账号名和「有没有凭据」。这条命令同时禁掉交互与 GCM 弹窗，纯粹当查询用。
+#[tauri::command]
+fn get_remote_credential(state: tauri::State<AppState>) -> Result<RemoteCredential, String> {
+    with_repo!(state, repo, {
+        let url = repo
+            .find_remote("origin")
+            .ok()
+            .and_then(|r| r.url().map(str::to_string))
+            .unwrap_or_default();
+
+        if url.trim().is_empty() {
+            return Ok(RemoteCredential {
+                url,
+                scheme: String::new(),
+                host: String::new(),
+                username: String::new(),
+                has_credential: false,
+                level: "info".to_string(),
+                note: "这个仓库没有配置远程地址（origin），不涉及推送凭据".to_string(),
+            });
+        }
+
+        let (scheme, host, path, url_user) = parse_remote_url(&url);
+
+        // SSH：认证走 key，凭据管理器完全不参与，别去查它
+        if scheme == "ssh" {
+            return Ok(RemoteCredential {
+                url,
+                scheme,
+                username: url_user,
+                has_credential: false,
+                level: "info".to_string(),
+                host: host.clone(),
+                note: format!(
+                    "走 SSH key 认证，凭据管理器不参与。key 一般在 %USERPROFILE%\\.ssh\\ 下；\
+                     用 ssh -T git@{host} 可以测连通性"
+                ),
+            });
+        }
+
+        if scheme.is_empty() {
+            return Ok(RemoteCredential {
+                url,
+                scheme,
+                host,
+                username: String::new(),
+                has_credential: false,
+                level: "info".to_string(),
+                note: "这个远程地址的写法认不出来，无法判断凭据（支持 https:// / http:// / ssh 形式）"
+                    .to_string(),
+            });
+        }
+
+        // HTTPS / HTTP：问 git 用哪个账号
+        let mut input = format!("protocol={scheme}\nhost={host}\n");
+        if !path.is_empty() {
+            input.push_str(&format!("path={path}\n"));
+        }
+        if !url_user.is_empty() {
+            input.push_str(&format!("username={url_user}\n"));
+        }
+        input.push('\n');
+
+        let mut child = std::process::Command::new("git")
+            .args(["credential", "fill"])
+            .env("GIT_TERMINAL_PROMPT", "0") // 别卡在交互提示上
+            .env("GCM_INTERACTIVE", "never") // 更别弹 GCM 的窗
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法执行 git（是否已安装并在 PATH 中？）：{e}"))?;
+        {
+            use std::io::Write;
+            let mut si = child.stdin.take().ok_or("无法写入 git 的标准输入")?;
+            si.write_all(input.as_bytes()).map_err(to_err)?;
+            // si 在这里 drop → 关掉 stdin，git 才会开始处理
+        }
+        let out = child.wait_with_output().map_err(to_err)?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+        let mut username = String::new();
+        let mut has_password = false;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("username=") {
+                username = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("password=") {
+                has_password = !v.trim().is_empty();
+            }
+        }
+        drop(text); // 含 password 的整段立刻释放
+
+        let (level, note) = if has_password {
+            let who = if username.is_empty() {
+                "（git 没返回用户名）".to_string()
+            } else {
+                format!("「{username}」")
+            };
+            (
+                "ok",
+                format!("该主机已有凭据，推送时会以{who}登录"),
+            )
+        } else {
+            (
+                "warn",
+                "该主机没有已存凭据：推送时会要求输入账号/密码，在无人值守的环境里会直接失败"
+                    .to_string(),
+            )
+        };
+
+        Ok(RemoteCredential {
+            url,
+            scheme,
+            host,
+            username,
+            has_credential: has_password,
+            level: level.to_string(),
+            note,
+        })
+    })
+}
+
+// ---------- 用当前身份重写 HEAD 提交的作者（amend） ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AmendResult {
+    old_author: String,
+    new_author: String,
+    old_oid: String,
+    new_oid: String,
+    /// 原提交是否就是上游 ref 指向的那一条（= 已经推上去了）。
+    /// true 表示本地与远端马上要分叉，下次 push 会被拒（得 force）—— 前端据此警告。
+    already_pushed: bool,
+}
+
+/// 重写 HEAD 提交的作者，用当前生效的提交身份（等价 `git commit --amend --author="..."`）。
+///
+/// 三处刻意的选择：
+///   · **保留原 author 时间**：只换名字/邮箱，作者的时间线不动。对应 `--author=`，
+///     而不是 `--reset-author`（后者会把作者时间改成现在，等于篡改历史时间）。
+///   · **tree 传 None 保持不动**（也不读 index）：所以暂存区里那些还没提交的改动绝不会被
+///     卷进这次改写 —— 原生 `git commit --amend` 会卷进去，那对「只改作者」是意外行为。
+///   · committer 换成当前身份 + 当前时间：这是 amend 的正常语义（"这次是我改的"）。
+///
+/// 只对 HEAD 生效：amend 的本质就是替换 HEAD；改历史中间某条得走 rebase，不在这个入口的职责里。
+#[tauri::command]
+fn amend_head_author(state: tauri::State<AppState>) -> Result<AmendResult, String> {
+    with_repo!(state, repo, {
+        let head = repo.head().map_err(to_err)?;
+        if !head.is_branch() {
+            return Err("当前不在任何分支上（分离 HEAD），无法重写作者".to_string());
+        }
+        let commit = head.peel_to_commit().map_err(to_err)?;
+
+        let sig = repo.signature().map_err(|e| {
+            format!("读不到当前提交身份（user.name / user.email）：{e}\n先在顶栏的身份徽标里配置")
+        })?;
+        let author_name = sig.name().unwrap_or_default().to_string();
+        let author_email = sig.email().unwrap_or_default().to_string();
+        if author_name.is_empty() || author_email.is_empty() {
+            return Err("当前提交身份不完整（user.name / user.email 有空值）".to_string());
+        }
+
+        let old_name = commit.author().name().unwrap_or_default().to_string();
+        let old_email = commit.author().email().unwrap_or_default().to_string();
+        let old_author = format!("{old_name} <{old_email}>");
+        let new_author = format!("{author_name} <{author_email}>");
+        if old_author == new_author {
+            return Err(format!("HEAD 的作者已经是 {new_author}，无需重写"));
+        }
+
+        // 新 author = 当前身份的名字/邮箱 + **原提交的 author 时间**
+        let author_time = commit.author().when();
+        let author = git2::Signature::new(&author_name, &author_email, &author_time).map_err(to_err)?;
+
+        let old_oid = commit.id();
+
+        // 判定「是否已经推上去」：拿当前分支上游 ref 的 oid 直接和 HEAD 比。
+        // 比的是"上游 tip 是否就是这条"——正好是「改完会和远端分叉」的那种情形。
+        let already_pushed = repo
+            .head()
+            .ok()
+            .filter(|h| h.is_branch())
+            .and_then(|h| h.shorthand().map(str::to_string))
+            .and_then(|n| repo.find_branch(&n, BranchType::Local).ok())
+            .and_then(|b| b.upstream().ok())
+            .and_then(|u| u.get().target())
+            == Some(old_oid);
+
+        // git_commit_amend：新提交与旧提交「只有非 None 的项被替换」，parents 自动沿用旧提交。
+        //   · author 传新签名 → 换掉名字/邮箱（时间用上面构造的，保持原样）
+        //   · committer 传当前签名 → amend 的正常语义
+        //   · message_encoding / message / tree 传 None → **原样不动**。
+        //     特别是 tree：不传就不会把暂存区里那些还没提交的改动卷进来。
+        //
+        // ⚠️ 别用 repo.commit(Some("HEAD"), ...) 来做 amend：libgit2 会校验
+        //    「新提交的第一个 parent 必须是当前 ref 的 tip」，而 amend 的第一个 parent
+        //    恰恰是**旧提交的父**，必然报 "current tip is not the first parent"
+        //    （探针实测踩出来的，不是推测）。
+        let new_oid = commit
+            .amend(Some("HEAD"), Some(&author), Some(&sig), None, None, None)
+            .map_err(to_err)?;
+
+        Ok(AmendResult {
+            old_author,
+            new_author,
+            old_oid: old_oid.to_string(),
+            new_oid: new_oid.to_string(),
+            already_pushed,
+        })
+    })
+}
+
 #[tauri::command]
 fn get_recent(app: tauri::AppHandle) -> Vec<RecentEntry> {
     // 返回前按当前磁盘情况计算 exists —— 文件被移动/删除后再次打开 UI 会有直观显示，
@@ -1454,6 +1892,11 @@ pub fn run() {
             get_ahead_behind,
             get_remote_url,
             set_remote_url,
+            get_identity,
+            set_identity,
+            clear_local_identity,
+            get_remote_credential,
+            amend_head_author,
             stash_list,
             stash_save,
             stash_pop,
