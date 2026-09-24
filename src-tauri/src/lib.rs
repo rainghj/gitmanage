@@ -727,11 +727,152 @@ fn abort_merge(state: tauri::State<AppState>) -> Result<String, String> {
 
 // ---------- 分支操作 ----------
 
+/// 把 libgit2 的 SAFE checkout 冲突原文翻成人话（原文照旧附在后面，便于诊断）。
+///
+/// 撞上本地改动时 libgit2 只给一句
+///   `1 conflict prevents checkout: class=Checkout (20); code=Conflict (-13)`
+/// ——字面上完全看不出「是未提交的改动挡住了」，class/code 是给调用方分支判断用的，
+/// 不是给用户看的。这里补一句说明 + 出口，原始错误保留在末尾。
+///
+/// 判据用字符串匹配而不是 `e.class()/e.code()`：libgit2 在个别版本里把同一个语义
+/// 归到不同 class（Checkout / Index / Tree 都见过），"prevents checkout" 这句才是稳定的。
+fn checkout_err(name: &str, e: git2::Error) -> String {
+    let raw = e.to_string();
+    if raw.contains("prevents checkout") {
+        return format!(
+            "工作区有未提交的改动，切到 {name} 会被覆盖，git 已阻止这次切换（当前什么都没动）。\n\
+             处理办法：先提交，或把改动暂存（左下角「暂存」按钮），或放弃这些文件的改动。\n\
+             原始错误：{raw}"
+        );
+    }
+    raw
+}
+
+/// 被本地改动挡住时，给出一条能把「挡的是什么」摊开的消息（错误条与控制台都用它）。
+/// 文件列表设上限：几十个文件全列出来会把错误条撑满，反而看不清结论。
+fn checkout_blocked_msg(name: &str, blockers: &[String]) -> String {
+    const MAX_LIST: usize = 20;
+    let mut msg = format!(
+        "无法切换到 {name}：{} 个文件有未提交的改动，切过去会被覆盖（未做任何改动）。",
+        blockers.len()
+    );
+    for p in blockers.iter().take(MAX_LIST) {
+        msg.push_str(&format!("\n  {p}"));
+    }
+    if blockers.len() > MAX_LIST {
+        msg.push_str(&format!("\n  … 还有 {} 个", blockers.len() - MAX_LIST));
+    }
+    msg.push_str("\n\n处理办法：先提交，或用左下角「暂存」把改动收进 stash，或放弃这些文件的改动。");
+    msg
+}
+
+/// 切换前预检：算出「切到 target 会被覆盖、因而会被 libgit2 拒绝」的本地改动文件。
+///
+/// 判据（与 libgit2 的 SAFE checkout 逐条实测对齐，见 `_scratch/checkout_probe.rs`）：
+///   1) **范围**先限定在「切换会动的文件」= diff(当前 HEAD tree, 目标 tree)。没被切换碰到的文件
+///      不可能冲突——它在工作区里怎么改都无所谓。
+///   2) 在这个范围里，只有「**该路径在工作区/索引层面是脏的**」且「**工作区内容与目标内容不同**」
+///      才算冲突：脏但内容已与目标一致（比如自己改成了目标那份）→ 切换没有东西可覆盖，不拦。
+///
+/// 「脏」用 `status_file` 判，不是自己比字节——实测出来的坑：
+///   · 本地删除未暂存（rm 没 git rm）→ libgit2 也拒（它要把文件恢复出来），status 是 WT_DELETED；
+///   · 已暂存但工作区与 index 一致 → libgit2 **照样拒**（改动在 index 里同样会被冲掉），
+///     所以不能拿「工作区 == index」当干净的判据，必须看 status 的 INDEX_* 位。
+/// 纯本地、只读：不联网、不动 index、不动工作区。
+fn checkout_blockers(repo: &Repository, target: Oid) -> Result<Vec<String>, String> {
+    let Some(workdir) = repo.workdir().map(|w| w.to_path_buf()) else {
+        return Ok(Vec::new()); // 裸仓库
+    };
+    // 还没有任何提交（unborn HEAD）时没有 HEAD tree 可 diff，直接放行
+    let Some(head_tree) = repo.head().ok().and_then(|h| h.peel_to_tree().ok()) else {
+        return Ok(Vec::new());
+    };
+    let target_tree = repo
+        .find_commit(target)
+        .map_err(to_err)?
+        .tree()
+        .map_err(to_err)?;
+    let diff = repo
+        .diff_tree_to_tree(Some(&head_tree), Some(&target_tree), None)
+        .map_err(to_err)?;
+
+    // 工作区/索引层面「动过」的所有位（含已暂存的 INDEX_*：它也挡切换，见函数注释）
+    let dirty_bits = git2::Status::WT_NEW
+        | git2::Status::WT_MODIFIED
+        | git2::Status::WT_DELETED
+        | git2::Status::WT_RENAMED
+        | git2::Status::WT_TYPECHANGE
+        | git2::Status::INDEX_NEW
+        | git2::Status::INDEX_MODIFIED
+        | git2::Status::INDEX_DELETED
+        | git2::Status::INDEX_RENAMED
+        | git2::Status::INDEX_TYPECHANGE
+        | git2::Status::CONFLICTED;
+
+    let mut out: Vec<String> = Vec::new();
+    for delta in diff.deltas() {
+        let Some(path) = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_path_buf())
+        else {
+            continue;
+        };
+        let st = repo.status_file(&path).unwrap_or(git2::Status::CURRENT);
+        if (st & dirty_bits).is_empty() {
+            continue; // 干净文件：切换覆盖它是正常行为
+        }
+        let work_bytes = std::fs::read(workdir.join(&path)).ok();
+        let target_bytes = match target_tree.get_path(&path) {
+            Ok(entry) => repo.find_blob(entry.id()).ok().map(|b| b.content().to_vec()),
+            Err(_) => None,
+        };
+        // 内容已经和目标一致 → 切换写不写都一样，不算冲突
+        if work_bytes != target_bytes {
+            out.push(path.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// 切换分支的只读预检：前端拿它决定「直接切」还是「弹一个能选出口的处理层」。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutPreview {
+    ok: bool,
+    blockers: Vec<String>,
+}
+
+#[tauri::command]
+fn checkout_preview(
+    state: tauri::State<AppState>,
+    name: String,
+) -> Result<CheckoutPreview, String> {
+    with_repo!(state, repo, {
+        let target = repo
+            .revparse_single(&name)
+            .map_err(to_err)?
+            .peel_to_commit()
+            .map_err(to_err)?
+            .id();
+        let blockers = checkout_blockers(repo, target)?;
+        Ok(CheckoutPreview {
+            ok: blockers.is_empty(),
+            blockers,
+        })
+    })
+}
+
 #[tauri::command]
 fn checkout_branch(state: tauri::State<AppState>, name: String) -> Result<(), String> {
     with_repo!(state, repo, {
         let (obj, reference) = repo.revparse_ext(&name).map_err(to_err)?;
-        repo.checkout_tree(&obj, None).map_err(to_err)?;
+        // 仍走 libgit2 的 SAFE checkout（会拒绝覆盖本地改动）；只是把撞车时的原文翻成人话
+        repo.checkout_tree(&obj, None)
+            .map_err(|e| checkout_err(&name, e))?;
         match reference {
             Some(r) => repo
                 .set_head(r.name().ok_or("invalid ref name")?)
@@ -791,6 +932,16 @@ fn create_branch_impl(
             .map_err(to_err)?,
         None => repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?,
     };
+
+    // 前置预检：切过去会被本地改动挡住时，**在建分支之前**就报错退出。
+    // 否则会留下「分支建好了、人却还在原分支」的半成品（原实现就是这个顺序）。
+    if checkout {
+        let blockers = checkout_blockers(repo, start.id())?;
+        if !blockers.is_empty() {
+            return Err(checkout_blocked_msg(name, &blockers));
+        }
+    }
+
     repo.branch(name, &start, false).map_err(to_err)?;
 
     if let Some(short) = upstream_short.as_deref() {
@@ -802,7 +953,14 @@ fn create_branch_impl(
         let obj = repo
             .revparse_single(&format!("refs/heads/{name}"))
             .map_err(to_err)?;
-        repo.checkout_tree(&obj, None).map_err(to_err)?;
+        if let Err(e) = repo.checkout_tree(&obj, None).map_err(|e| checkout_err(name, e)) {
+            // 预检之外仍切不过去（例如索引里有未提交的删除/重命名）：把刚建的分支撤掉，
+            // 不留「分支建好了但人还在原分支」的半成品。
+            if let Ok(mut b) = repo.find_branch(name, BranchType::Local) {
+                let _ = b.delete();
+            }
+            return Err(e);
+        }
         repo.set_head(&format!("refs/heads/{name}")).map_err(to_err)?;
     }
     Ok(())
@@ -1110,6 +1268,53 @@ fn discard_file_changes(state: tauri::State<AppState>, path: String) -> Result<S
         repo.checkout_index(None, Some(&mut opts)).map_err(to_err)?;
         Ok(format!("已放弃改动: {path}"))
     })
+}
+
+/// 「放弃这些文件的改动」= 真的回到 HEAD，**含清掉已暂存的改动**。
+///
+/// 与 `discard_file_changes` 的区别：那个恢复的是 **index 版本**（对已暂存文件 = 保留暂存内容，
+/// 因为 index 里存的就是那份新内容），只够撤掉「工作区那点手改」；而切换受阻时挡路的往往还有
+/// **暂存区**里的改动——实测 libgit2 对 INDEX_MODIFIED 一样拒（见 `_scratch/checkout_probe.rs` ⑦），
+/// 所以这里必须把 index 也归位到 HEAD。顺序不能反：先归位 index，再按 index 刷工作区。
+fn discard_paths_to_head_impl(repo: &Repository, paths: &[String]) -> Result<String, String> {
+    let workdir = repo.workdir().ok_or("裸仓库不支持此操作")?.to_path_buf();
+    let head = repo.head().map_err(to_err)?.peel_to_commit().map_err(to_err)?;
+    let head_tree = head.tree().map_err(to_err)?;
+
+    // index 归位到 HEAD（等价 `git reset -- <paths>`）：已暂存的改动、以及「已暂存但 HEAD 里没有」
+    // 的新文件条目都在这一步清掉。这里走 pathspec 接口，路径原样传即可（精确匹配）。
+    let specs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    repo.reset_default(Some(head.as_object()), specs.iter().copied())
+        .map_err(to_err)?;
+
+    let mut restored = 0usize;
+    let mut removed = 0usize;
+    for p in paths {
+        let rel = std::path::Path::new(p);
+        if head_tree.get_path(rel).is_ok() {
+            // index 刚归位到 HEAD，让工作区跟着 index 走（force 覆盖本地改动）
+            let mut opts = git2::build::CheckoutBuilder::new();
+            opts.path(p).force();
+            repo.checkout_index(None, Some(&mut opts)).map_err(to_err)?;
+            restored += 1;
+        } else {
+            // HEAD 里没有这个文件 = 未跟踪的新文件，直接删
+            let full = workdir.join(rel);
+            if full.is_file() {
+                std::fs::remove_file(&full).map_err(|e| format!("删除失败: {e}"))?;
+            }
+            removed += 1;
+        }
+    }
+    Ok(format!("已放弃 {restored} 个文件的改动，删除 {removed} 个新增文件"))
+}
+
+#[tauri::command]
+fn discard_paths_to_head(
+    state: tauri::State<AppState>,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    with_repo!(state, repo, { discard_paths_to_head_impl(repo, &paths) })
 }
 
 // ---------- 远程操作（git CLI 侧车） ----------
@@ -1872,6 +2077,7 @@ pub fn run() {
             get_conflict_sides,
             abort_merge,
             checkout_branch,
+            checkout_preview,
             create_branch,
             delete_branch,
             rename_branch,
@@ -1880,6 +2086,7 @@ pub fn run() {
             stage_all,
             stage_files,
             discard_file_changes,
+            discard_paths_to_head,
             get_skip_list,
             set_skip,
             commit,

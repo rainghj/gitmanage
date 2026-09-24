@@ -1533,6 +1533,11 @@ function App() {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; inSkip: boolean } | null>(null);
   // 「放弃更改」的二次确认弹窗（值为待确认的文件路径）
   const [discardConfirm, setDiscardConfirm] = useState<string | null>(null);
+  // 「切换被未提交改动挡住」的处理层：预检发现会被覆盖的文件时弹，给出处理出口
+  const [checkoutBlock, setCheckoutBlock] = useState<{
+    target: string;
+    files: string[];
+  } | null>(null);
   // 提交历史右键菜单（复制 hash / 提交信息）
   const [commitCtx, setCommitCtx] = useState<{ x: number; y: number; oid: string; summary: string } | null>(null);
   // 分支树右键菜单 + 重命名弹窗
@@ -1896,7 +1901,26 @@ function App() {
 
   // ---------- 分支 / 提交操作 ----------
 
+  // 切换分支。先做一次**只读预检**：libgit2 的 SAFE checkout 撞上本地改动会直接拒绝，
+  // 而它的原文只有 `1 conflict prevents checkout: class=Checkout (20); code=Conflict (-13)`——
+  // 除了 class/code 什么都没有，用户看不出「被什么挡住」也不知道能干什么。
+  // 预检能把「哪些文件挡着」提前拿到，于是可以弹一个带出口的处理层，而不是甩一条错误。
   async function checkoutBranch(name: string) {
+    let preview: { ok: boolean; blockers: string[] } = { ok: true, blockers: [] };
+    try {
+      preview = await invoke<{ ok: boolean; blockers: string[] }>(
+        "checkout_preview",
+        { name },
+      );
+    } catch {
+      // 预检自己失败（分支名解析不了、仓库状态怪）不该挡住切换：
+      // 交给下面真正的 checkout 去报错，那里也有兜底的人话提示。
+      preview = { ok: true, blockers: [] };
+    }
+    if (!preview.ok) {
+      setCheckoutBlock({ target: name, files: preview.blockers });
+      return;
+    }
     if (!confirm(`切换到分支 ${name}？`)) return;
     try {
       await invoke("checkout_branch", { name });
@@ -1904,6 +1928,58 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  // 出口一：把改动压进 stash（含未跟踪）再切换。
+  // **不自动 pop**：pop 撞冲突会把 index 弄成冲突态，而那不是 MERGE 状态、左栏「冲突」页读不出来，
+  // 用户会卡在一个看不懂的中间态。改动留在 stash 里随时能恢复，是可逆得多的选择。
+  async function stashAndCheckout(target: string) {
+    setCheckoutBlock(null);
+    setConsoleOpen(true);
+    const argv = `> git stash push -u\n> git checkout ${target}\n`;
+    try {
+      await invoke<string>("stash_save", { message: `切换 ${target} 前自动暂存` });
+      await invoke("checkout_branch", { name: target });
+      setConsoleText(
+        `${argv}改动已暂存（stash@{0}，含未跟踪文件），已切换到 ${target}。\n` +
+          `恢复入口：左下角 Stash 面板 → pop。`,
+      );
+    } catch (e) {
+      setConsoleText(`${argv}${String(e)}`);
+      setError(String(e));
+    }
+    await refresh();
+  }
+
+  // 出口二：放弃这些文件的改动再切换。⚠ 不可恢复，所以必须二次确认（和「放弃更改」同一套口径）。
+  async function discardAndCheckout(target: string, files: string[]) {
+    const preview = files.slice(0, 10).join("\n");
+    const more = files.length > 10 ? `\n… 还有 ${files.length - 10} 个` : "";
+    if (
+      !confirm(
+        `确认放弃 ${files.length} 个文件的改动并切换到 ${target}？\n\n${preview}${more}\n\n` +
+          `已跟踪文件会还原到当前提交的内容，未跟踪的新文件会被直接删除。此操作不可恢复。`,
+      )
+    ) {
+      return;
+    }
+    setCheckoutBlock(null);
+    setConsoleOpen(true);
+    try {
+      // 用「回到 HEAD」的专用命令，而不是循环调单文件的 discard_file_changes：
+      // 后者恢复的是 **index 版本**，对已暂存的改动等于什么都没放弃（暂存内容还在 index 里），
+      // 切换照样会被挡。这里连 index 一起归位（等价 git reset -- <paths> + 刷工作区）。
+      const msg = await invoke<string>("discard_paths_to_head", { paths: files });
+      await invoke("checkout_branch", { name: target });
+      setConsoleText(
+        `> git reset -- <${files.length} 个文件>\n> git checkout -- <${files.length} 个文件>\n` +
+          `> git checkout ${target}\n${msg}\n已切换到 ${target}。`,
+      );
+    } catch (e) {
+      setConsoleText(String(e));
+      setError(String(e));
+    }
+    await refresh();
   }
 
   async function createBranch() {
@@ -2671,7 +2747,19 @@ function App() {
         )}
       </header>
 
-      {error && <div className="error-bar">⚠ {error}</div>}
+      {error && (
+        <div className="error-bar">
+          <span className="error-mark">⚠</span>
+          <span className="error-text">{error}</span>
+          <button
+            className="error-close"
+            onClick={() => setError("")}
+            title="关闭提示（不影响任何已做的操作）"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {!repo ? (
         <div className="welcome">
@@ -4112,6 +4200,64 @@ function App() {
                 重写
               </button>
               <button className="ghost" onClick={() => setAmendOpen(false)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 「切换被未提交改动挡住」处理层。git 拒绝切换是对的（保护未提交的改动），
+          但光给一条错误等于把问题丢回给用户：这里把「挡着的是哪些文件」和「能怎么走」摊开。 */}
+      {checkoutBlock && (
+        <div className="ctx-overlay dim" onClick={() => setCheckoutBlock(null)}>
+          <div
+            className="confirm-box checkout-block"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="confirm-title">
+              无法切换到 {checkoutBlock.target}
+            </div>
+            <div className="confirm-desc">
+              这些文件有未提交的改动，切过去会被覆盖，git 已阻止切换（当前什么都没动）。
+            </div>
+            <ul className="block-list">
+              {checkoutBlock.files.map((f) => (
+                <li key={f} title={f}>
+                  {f}
+                </li>
+              ))}
+              {checkoutBlock.files.length === 0 && (
+                <li className="block-none">
+                  （git 拒绝了切换，但没能定位到具体文件——多半是索引里有未提交的删除或重命名）
+                </li>
+              )}
+            </ul>
+            <div className="confirm-desc">
+              「暂存并切换」：把改动收进 stash（含未跟踪文件）再切过去，切回来在左下角
+              Stash 面板 pop 恢复。
+              <br />
+              「放弃改动并切换」：丢弃这些文件的改动，不可恢复。
+            </div>
+            <div className="confirm-actions">
+              <button onClick={() => stashAndCheckout(checkoutBlock.target)}>
+                暂存并切换
+              </button>
+              <button
+                className="danger-btn"
+                disabled={checkoutBlock.files.length === 0}
+                title={
+                  checkoutBlock.files.length === 0
+                    ? "没定位到具体文件，无法只放弃这些改动；请先在「更改」列表里手动处理"
+                    : undefined
+                }
+                onClick={() =>
+                  discardAndCheckout(checkoutBlock.target, checkoutBlock.files)
+                }
+              >
+                放弃改动并切换
+              </button>
+              <button className="ghost" onClick={() => setCheckoutBlock(null)}>
                 取消
               </button>
             </div>

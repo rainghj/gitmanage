@@ -227,11 +227,51 @@ button.link {
   text-decoration: underline;
 }
 
+/* 顶部错误条：可关闭、多行可读。
+   原来只有 padding/背景，前端拼在文案里的 \n 不会换行，长提示被挤成一条；也没有关闭入口，
+   一个已经处理过/不关心的错误会一直挂在顶上。 */
 .error-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   background: #5a1d1d;
   color: var(--red);
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  /* 长错误（例如被挡住的文件清单）不许顶掉整个界面 */
+  max-height: 28vh;
+  overflow: auto;
+}
+
+.error-mark {
+  flex: none;
+  line-height: 1.5;
+}
+
+.error-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap; /* 文案里的 \n 要真的换行，否则读不出层次 */
+  word-break: break-all; /* 长路径不撑出横向滚动条 */
+  line-height: 1.5;
+}
+
+.error-close {
+  flex: none;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.2;
+  padding: 0 2px;
+}
+
+.error-close:hover {
+  opacity: 1;
+  filter: none;
 }
 
 /* 渲染崩溃兜底页（ErrorBoundary） */
@@ -1261,6 +1301,38 @@ button.ghost.small {
 .danger-btn:hover {
   background: #c93b3b;
   filter: none;
+}
+
+/* 「切换被未提交改动挡住」处理层 */
+.checkout-block {
+  width: min(480px, 92vw);
+}
+
+.block-list {
+  margin-top: 10px;
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px 10px;
+  list-style: none;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.block-list li {
+  line-height: 1.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.block-list li.block-none {
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  white-space: normal;
+  color: var(--text-dim);
 }
 
 /* 分支重命名输入框 */
