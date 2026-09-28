@@ -91,11 +91,71 @@ pnpm dev
 
 ## 构建发布版
 
+GitManage 的前端资源（`dist/`）在**编译期嵌进 exe**，所以发布物就是一个自包含的单文件，不需要安装包就能跑。下面的流程按「裸 exe 部署」走（路线 A）。
+
+### 打包
+
 ```powershell
-pnpm tauri build
+cd C:\Users\guohj\code\gitmanage
+pnpm tauri build --no-bundle
 ```
 
-产物在 `src-tauri\target\release\bundle\`，`msi` 和 `nsis` 两种安装包都有，体积约 5-10MB（复用系统 WebView2，不打包运行时）。
+产物：`src-tauri\target\release\gitmanage.exe`（约 11MB）
+
+`--no-bundle` 的意思是**只编译、跳过"打成安装程序"那一步**。跳过它可以直接绕开 WiX / NSIS 工具链的首次下载（Tauri 会从 GitHub 拉，本机网络不稳）。跳过后 exe 依然能独立运行——前端已经嵌进去了，唯一外部依赖是 WebView2（Win11 自带）。
+
+### 首次部署
+
+`%LOCALAPPDATA%\Programs\` 是用户级安装位置（VS Code / Chrome 同款），**不需要管理员权限**：
+
+```powershell
+$dst = "$env:LOCALAPPDATA\Programs\GitManage"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Copy-Item .\src-tauri\target\release\gitmanage.exe "$dst\GitManage.exe" -Force
+
+# 建桌面快捷方式
+$ws  = New-Object -ComObject WScript.Shell
+$lnk = $ws.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\GitManage.lnk")
+$lnk.TargetPath = "$dst\GitManage.exe"
+$lnk.WorkingDirectory = $dst
+$lnk.Save()
+```
+
+想再要一个开始菜单项，把上面 `GetFolderPath('Desktop')` 换成 `GetFolderPath('StartMenu')` 后再执行一遍即可。
+
+### 更新（改完代码后）
+
+```powershell
+# 1) 先关掉正在运行的 GitManage —— 不关会因文件占用导致覆盖失败
+Stop-Process -Name gitmanage -ErrorAction SilentlyContinue
+
+# 2) 重新编译
+pnpm tauri build --no-bundle
+
+# 3) 覆盖部署
+Copy-Item .\src-tauri\target\release\gitmanage.exe "$env:LOCALAPPDATA\Programs\GitManage\GitManage.exe" -Force
+```
+
+### 注意事项
+
+- **别用 `cargo build --release` 代替打包命令。** 它不会重新生成 `dist/`——如果前端改过而 `dist/` 还是旧的，嵌进 exe 的就是旧界面，而且**不会报错**。`pnpm tauri build --no-bundle` 会先跑 `pnpm build`（tsc + vite），保证前端是新的。
+- 发版要手动改 `src-tauri/tauri.conf.json` 里的 `version`（当前 `0.1.0`）。将来用安装包覆盖安装或接自动更新时，版本不递增会被判为"同版本"而跳过。
+- `pnpm tauri build` 会先跑 `tsc` 类型检查。`tauri dev` 走 Vite **不做**类型检查，所以第一次 build 可能一次性暴露一批 TS 报错——先修类型，不是打包本身的问题。
+- 打出来的 exe **未签名**：自己用没问题，但分发给别人时会被 Windows 11 的智能应用控制（SAC）/ SmartScreen 拦截。
+
+### 可选：打成正式安装包
+
+需要安装向导、开始菜单项、控制面板卸载入口时才用（走这条路会多出 WiX / NSIS 工具链的下载）：
+
+```powershell
+# 首次需挂代理：WiX / NSIS 工具链从 GitHub 下载
+$env:HTTP_PROXY='http://127.0.0.1:7897'; $env:HTTPS_PROXY='http://127.0.0.1:7897'
+pnpm tauri build --bundles nsis
+```
+
+产物：`src-tauri\target\release\bundle\nsis\GitManage_0.1.0_x64-setup.exe`
+
+> `tauri.conf.json` 里 `bundle.targets` 是 `"all"`（会同时出 MSI + NSIS）。命令里显式写 `--bundles nsis` 就只出 NSIS，能省掉 WiX 那约 30MB 的工具下载。
 
 ## 常用命令速查
 
@@ -104,7 +164,8 @@ pnpm tauri build
 | `pnpm tauri dev` | 开发模式，改代码自动重载 |
 | `pnpm dev` | 只启 Vite（前端调试） |
 | `pnpm build` | `tsc` 类型检查 + 前端打包 |
-| `pnpm tauri build` | 打安装包 |
+| `pnpm tauri build --no-bundle` | 编译发布版 exe（部署 / 更新用，见上节） |
+| `pnpm tauri build --bundles nsis` | 额外打成 NSIS 安装包（首次需挂代理） |
 | `pnpm tauri info` | 打印环境诊断信息（排查编译问题时用） |
 
 ## 功能一览
